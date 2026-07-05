@@ -133,7 +133,7 @@ impl<'probe> JtagDtm<'probe> {
         loop {
             match self.dmi_register_access(op)? {
                 Ok(result) => return Ok(result),
-                Err(DmiOperationStatus::RequestInProgress) => {
+                Err(DmiOperationStatus::RequestInProgress | DmiOperationStatus::Reserved) => {
                     // Operation still in progress, reset dmi status and try again.
                     self.clear_error_state()?;
                     self.probe
@@ -340,7 +340,7 @@ impl DmiOperationStatus {
     pub fn map_as_err(self) -> Result<(), RiscvError> {
         match self {
             DmiOperationStatus::Ok => Ok(()),
-            DmiOperationStatus::Reserved => unimplemented!("Reserved."),
+            DmiOperationStatus::Reserved => Err(RiscvError::DtmOperationFailed),
             DmiOperationStatus::OperationFailed => Err(RiscvError::DtmOperationFailed),
             DmiOperationStatus::RequestInProgress => Err(RiscvError::DtmOperationInProcess),
         }

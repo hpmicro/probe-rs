@@ -723,7 +723,7 @@ impl<'state> RiscvCommunicationInterface<'state> {
     ///
     /// Use the [`read_dm_register`] function if possible.
     fn read_dm_register_untyped(&mut self, address: u64) -> Result<u32, RiscvError> {
-        self.dtm.read_with_timeout(address, Duration::from_millis(100))
+        self.dtm.read_with_timeout(address, Duration::from_millis(1000))
     }
 
     pub(crate) fn write_dm_register<R: MemoryMappedRegister<u32>>(
