@@ -254,6 +254,16 @@ const RISCV_TIMEOUT: Duration = Duration::from_secs(5);
 /// [Zicsr](https://riscv.org/wp-content/uploads/2019/06/riscv-spec.pdf#chapter.9) extension
 const RISCV_MAX_CSR_ADDR: u16 = 0xFFF;
 
+/// Abstract access-memory command (cmdtype 2) for a 32-bit read with
+/// post-increment: cmdtype in bits [31:24], aamsize 2 (32-bit) in bits
+/// [22:20], physical addressing (aamvirtual, bit 23, clear), and
+/// aampostincrement at bit 19. The layout is pinned against the
+/// [`AccessMemoryCommand`] field definitions by a unit test.
+const ACCESS_MEMORY_READ: u32 = 2 << 24 | 2 << 20 | 1 << 19;
+
+/// The same access-memory command with the write bit (bit 16) set.
+const ACCESS_MEMORY_WRITE: u32 = ACCESS_MEMORY_READ | 1 << 16;
+
 impl RiscvCommunicationInterfaceState {
     /// Create a new interface state.
     pub fn new() -> Self {
@@ -377,6 +387,31 @@ impl<'state> RiscvCommunicationInterface<'state> {
         self.write_dm_register(control)?;
         self.state.last_selected_hart = hart;
         Ok(())
+    }
+
+    /// Overrides the memory access method used for every access width.
+    ///
+    /// The method is normally chosen from the debug module's reported
+    /// capabilities. Forcing it is meant for diagnostics and performance
+    /// tooling that needs to compare the available transport methods on
+    /// the same target. Passing `None` clears any previously forced
+    /// choice; the default (program buffer) then applies until the next
+    /// attach re-probes the debug module's capabilities.
+    pub fn force_memory_access_method(&mut self, method: Option<MemoryAccessMethod>) {
+        match method {
+            Some(method) => {
+                for width in [
+                    RiscvBusAccess::A8,
+                    RiscvBusAccess::A16,
+                    RiscvBusAccess::A32,
+                    RiscvBusAccess::A64,
+                    RiscvBusAccess::A128,
+                ] {
+                    self.state.memory_access_info.insert(width, method);
+                }
+            }
+            None => self.state.memory_access_info.clear(),
+        }
     }
 
     /// Check if the given hart is enabled
@@ -908,6 +943,54 @@ impl<'state> RiscvCommunicationInterface<'state> {
         }
     }
 
+    /// Perform memory reads using the abstract access-memory command
+    /// (command type 2) with auto-increment. Only 32-bit accesses are
+    /// implemented; narrower widths fail loudly here rather than
+    /// degrading into a wrong-width access. The address is loaded into
+    /// arg1 once and each command reads the next word into data0.
+    fn perform_memory_read_multiple_abstract<V: RiscvValue32>(
+        &mut self,
+        address: u32,
+        data: &mut [V],
+    ) -> Result<(), RiscvError> {
+        if V::WIDTH != RiscvBusAccess::A32 {
+            return Err(RiscvError::UnsupportedBusAccessWidth(V::WIDTH));
+        }
+
+        self.write_dm_register(Data1(address))?;
+
+        for slot in data.iter_mut() {
+            self.execute_abstract_command(ACCESS_MEMORY_READ)?;
+            let word: Data0 = self.read_dm_register()?;
+            *slot = V::from_register_value(word.0);
+        }
+
+        Ok(())
+    }
+
+    /// Perform memory writes using the abstract access-memory command
+    /// with auto-increment: data goes through data0, the address through
+    /// arg1. As with reads, only 32-bit widths are implemented and
+    /// narrower widths fail loudly.
+    fn perform_memory_write_multiple_abstract<V: RiscvValue32>(
+        &mut self,
+        address: u32,
+        data: &[V],
+    ) -> Result<(), RiscvError> {
+        if V::WIDTH != RiscvBusAccess::A32 {
+            return Err(RiscvError::UnsupportedBusAccessWidth(V::WIDTH));
+        }
+
+        self.write_dm_register(Data1(address))?;
+
+        for value in data {
+            self.write_dm_register(Data0((*value).into()))?;
+            self.execute_abstract_command(ACCESS_MEMORY_WRITE)?;
+        }
+
+        Ok(())
+    }
+
     /// Perform memory read from a single location using the program buffer.
     /// Only reads up to a width of 32 bits are currently supported.
     fn perform_memory_read_progbuf<V: RiscvValue32>(
@@ -1423,7 +1506,9 @@ impl<'state> RiscvCommunicationInterface<'state> {
             MemoryAccessMethod::ProgramBuffer => self.perform_memory_read_progbuf(address)?,
             MemoryAccessMethod::SystemBus => self.perform_memory_read_sysbus(address)?,
             MemoryAccessMethod::AbstractCommand => {
-                unimplemented!("Memory access using abstract commands is not implemted")
+                let mut word = [V::from_register_value(0); 1];
+                self.perform_memory_read_multiple_abstract(address, &mut word)?;
+                word[0]
             }
         };
 
@@ -1445,7 +1530,7 @@ impl<'state> RiscvCommunicationInterface<'state> {
                 self.perform_memory_read_multiple_sysbus(address, data)?;
             }
             MemoryAccessMethod::AbstractCommand => {
-                unimplemented!("Memory access using abstract commands is not implemted")
+                self.perform_memory_read_multiple_abstract(address, data)?;
             }
         };
 
@@ -1459,7 +1544,7 @@ impl<'state> RiscvCommunicationInterface<'state> {
             }
             MemoryAccessMethod::SystemBus => self.perform_memory_write_sysbus(address, &[data])?,
             MemoryAccessMethod::AbstractCommand => {
-                unimplemented!("Memory access using abstract commands is not implemted")
+                self.perform_memory_write_multiple_abstract(address, &[data])?;
             }
         };
 
@@ -1477,7 +1562,7 @@ impl<'state> RiscvCommunicationInterface<'state> {
                 self.perform_memory_write_multiple_progbuf(address, data)?
             }
             MemoryAccessMethod::AbstractCommand => {
-                unimplemented!("Memory access using abstract commands is not implemted")
+                self.perform_memory_write_multiple_abstract(address, data)?;
             }
         }
 
@@ -2065,11 +2150,8 @@ impl From<RiscvBusAccess> for u8 {
 
 /// Different methods of memory access,
 /// which can be supported by a debug module.
-///
-/// The `AbstractCommand` method for memory access is not implemented.
-#[derive(Debug, Copy, Clone)]
-#[allow(dead_code)]
-enum MemoryAccessMethod {
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum MemoryAccessMethod {
     /// Memory access using the program buffer is supported
     ProgramBuffer,
     /// Memory access using an abstract command is supported
@@ -2273,3 +2355,348 @@ memory_mapped_bitfield_register! { pub struct Confstrptr0(u32); 0x19, "confstrpt
 memory_mapped_bitfield_register! { pub struct Confstrptr1(u32); 0x1a, "confstrptr1", impl From; }
 memory_mapped_bitfield_register! { pub struct Confstrptr2(u32); 0x1b, "confstrptr2", impl From; }
 memory_mapped_bitfield_register! { pub struct Confstrptr3(u32); 0x1c, "confstrptr3", impl From; }
+
+/// Scriptable [DtmAccess] double for hardware-free testing of the
+/// memory-access paths: immediate reads consult a register map (or a
+/// scripted response queue), writes are recorded, and scheduled
+/// operations commit on execute like a real transport.
+#[cfg(test)]
+pub(crate) mod test_mocks {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use super::RiscvError;
+    use crate::architecture::riscv::dtm::dtm_access::DtmAccess;
+    use crate::probe::{CommandResult, DebugProbeError, DeferredResultIndex};
+    use crate::MemoryMappedRegister;
+
+    /// Observable activity of a [MockDtmAccess]; shareable so tests can
+    /// inspect it after the interface has consumed the mock.
+    #[derive(Debug, Default)]
+    pub(crate) struct MockLog {
+        /// Every queued write, immediate or scheduled, in order.
+        pub writes: Vec<(u64, u32)>,
+        /// Addresses of scheduled reads, in order.
+        pub scheduled_reads: Vec<u64>,
+        /// Number of execute() flushes.
+        pub executes: usize,
+    }
+
+    #[derive(Debug, Default)]
+    pub(crate) struct MockDtmAccess {
+        pub log: Arc<Mutex<MockLog>>,
+        /// Committed DM register state, visible to immediate reads.
+        pub registers: HashMap<u64, u32>,
+        /// Values served by immediate reads before the register map, in
+        /// order; models data that advances with every read.
+        pub read_responses: VecDeque<u32>,
+        /// Values served by read_deferred_result, in order.
+        pub deferred_results: VecDeque<u32>,
+        /// Writes that are queued but not yet executed.
+        pending_writes: Vec<(u64, u32)>,
+    }
+
+    impl MockDtmAccess {
+        pub fn with_read_responses(responses: impl IntoIterator<Item = u32>) -> Self {
+            Self {
+                read_responses: responses.into_iter().collect(),
+                ..Default::default()
+            }
+        }
+
+        fn record_write(&mut self, address: u64, value: u32) {
+            self.log.lock().unwrap().writes.push((address, value));
+        }
+    }
+
+    impl DtmAccess for MockDtmAccess {
+        fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+
+        fn target_reset_deassert(&mut self) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+
+        fn clear_error_state(&mut self) -> Result<(), RiscvError> {
+            Ok(())
+        }
+
+        fn read_deferred_result(
+            &mut self,
+            _index: DeferredResultIndex,
+        ) -> Result<CommandResult, RiscvError> {
+            self.deferred_results
+                .pop_front()
+                .map(CommandResult::U32)
+                .ok_or(RiscvError::BatchedResultNotAvailable)
+        }
+
+        fn execute(&mut self) -> Result<(), RiscvError> {
+            self.log.lock().unwrap().executes += 1;
+            let pending = std::mem::take(&mut self.pending_writes);
+            for (address, value) in pending {
+                self.registers.insert(address, value);
+            }
+            Ok(())
+        }
+
+        fn schedule_write(
+            &mut self,
+            address: u64,
+            value: u32,
+        ) -> Result<Option<DeferredResultIndex>, RiscvError> {
+            self.record_write(address, value);
+            self.pending_writes.push((address, value));
+            Ok(Some(DeferredResultIndex::new_for_testing()))
+        }
+
+        fn schedule_read(&mut self, address: u64) -> Result<DeferredResultIndex, RiscvError> {
+            self.log.lock().unwrap().scheduled_reads.push(address);
+            Ok(DeferredResultIndex::new_for_testing())
+        }
+
+        fn read_with_timeout(
+            &mut self,
+            address: u64,
+            _timeout: Duration,
+        ) -> Result<u32, RiscvError> {
+            // Scripted responses model memory data arriving in data0; the
+            // command machinery's own register reads (dmcontrol,
+            // abstractcs) see the plain register map so commands complete
+            // immediately and cleanly.
+            if address == super::Data0::get_mmio_address() {
+                if let Some(value) = self.read_responses.pop_front() {
+                    return Ok(value);
+                }
+            }
+            Ok(self.registers.get(&address).copied().unwrap_or(0))
+        }
+
+        fn write_with_timeout(
+            &mut self,
+            address: u64,
+            value: u32,
+            _timeout: Duration,
+        ) -> Result<Option<u32>, RiscvError> {
+            self.record_write(address, value);
+            self.registers.insert(address, value);
+            Ok(Some(0))
+        }
+
+        fn read_idcode(&mut self) -> Result<Option<u32>, DebugProbeError> {
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_mocks::MockDtmAccess;
+    use super::*;
+
+    fn make_interface(
+        mock: MockDtmAccess,
+        state: &'_ mut RiscvCommunicationInterfaceState,
+    ) -> RiscvCommunicationInterface<'_> {
+        RiscvCommunicationInterface::new(Box::new(mock), state)
+    }
+
+    #[test]
+    fn abstract_access_memory_command_encoding() {
+        // The constants must match the AccessMemoryCommand field layout
+        // bit for bit: cmdtype 2 (access memory), aamsize 2 (32-bit),
+        // physical addressing (aamvirtual clear), post-increment set,
+        // and the target-specific bits [15:14] left clear.
+        let mut read = AccessMemoryCommand(0);
+        read.set_cmd_type(2);
+        read.set_aamsize(2);
+        read.set_aampostincrement(true);
+
+        assert_eq!(ACCESS_MEMORY_READ, read.0);
+        assert_eq!(ACCESS_MEMORY_READ, 0x0228_0000);
+        assert_eq!((ACCESS_MEMORY_READ >> 14) & 0x3, 0);
+
+        let mut write = AccessMemoryCommand(0);
+        write.set_cmd_type(2);
+        write.set_aamsize(2);
+        write.set_aampostincrement(true);
+        write.set_write(true);
+
+        // The write command differs by the write bit alone.
+        assert_eq!(ACCESS_MEMORY_WRITE, write.0);
+        assert_eq!(ACCESS_MEMORY_WRITE ^ ACCESS_MEMORY_READ, 1 << 16);
+    }
+
+    #[test]
+    fn force_memory_access_method_overrides_every_width() {
+        let mut state = RiscvCommunicationInterfaceState::new();
+        let mut interface = make_interface(MockDtmAccess::default(), &mut state);
+
+        interface.force_memory_access_method(Some(MemoryAccessMethod::AbstractCommand));
+        for width in [
+            RiscvBusAccess::A8,
+            RiscvBusAccess::A16,
+            RiscvBusAccess::A32,
+            RiscvBusAccess::A64,
+            RiscvBusAccess::A128,
+        ] {
+            assert_eq!(
+                interface.state.memory_access_method(width),
+                MemoryAccessMethod::AbstractCommand
+            );
+        }
+    }
+
+    #[test]
+    fn force_memory_access_method_none_restores_default() {
+        let mut state = RiscvCommunicationInterfaceState::new();
+        let mut interface = make_interface(MockDtmAccess::default(), &mut state);
+
+        interface.force_memory_access_method(Some(MemoryAccessMethod::SystemBus));
+        interface.force_memory_access_method(None);
+        for width in [
+            RiscvBusAccess::A8,
+            RiscvBusAccess::A16,
+            RiscvBusAccess::A32,
+            RiscvBusAccess::A64,
+            RiscvBusAccess::A128,
+        ] {
+            assert_eq!(
+                interface.state.memory_access_method(width),
+                MemoryAccessMethod::ProgramBuffer
+            );
+        }
+    }
+
+    #[test]
+    fn memory_dispatch_completes_via_abstract_command() {
+        // Regression for the removed unimplemented!() panics: with the
+        // method forced to abstract commands, every dispatch entry point
+        // completes against the mock instead of panicking.
+        let mut state = RiscvCommunicationInterfaceState::new();
+        let mut interface = make_interface(
+            MockDtmAccess::with_read_responses([0x11, 0x22, 0x33]),
+            &mut state,
+        );
+        interface.force_memory_access_method(Some(MemoryAccessMethod::AbstractCommand));
+
+        assert_eq!(interface.read_word::<u32>(0x1000).unwrap(), 0x11);
+
+        let mut words = [0u32; 2];
+        interface.read_multiple(0x1000, &mut words).unwrap();
+        assert_eq!(words, [0x22, 0x33]);
+
+        interface.write_word(0x1000, 0x44u32).unwrap();
+
+        let mut state = RiscvCommunicationInterfaceState::new();
+        let mut interface = make_interface(MockDtmAccess::default(), &mut state);
+        interface.force_memory_access_method(Some(MemoryAccessMethod::AbstractCommand));
+        interface.write_multiple(0x1000, &[0x55u32, 0x66]).unwrap();
+    }
+
+    #[test]
+    fn abstract_read_multiple_writes_arg1_once() {
+        let mut state = RiscvCommunicationInterfaceState::new();
+        let mock = MockDtmAccess::with_read_responses([10, 20, 30]);
+        let log = mock.log.clone();
+        let mut interface = make_interface(mock, &mut state);
+        interface.force_memory_access_method(Some(MemoryAccessMethod::AbstractCommand));
+
+        let mut words = [0u32; 3];
+        interface.read_multiple(0x2000, &mut words).unwrap();
+        assert_eq!(words, [10, 20, 30]);
+
+        let log = log.lock().unwrap();
+        let arg1_writes: Vec<_> = log
+            .writes
+            .iter()
+            .filter(|(address, _)| *address == Data1::get_mmio_address())
+            .collect();
+        // The start address is loaded into arg1 exactly once; the
+        // post-increment carries it from there.
+        assert_eq!(arg1_writes.len(), 1);
+        assert_eq!(arg1_writes[0], &(Data1::get_mmio_address(), 0x2000u32));
+        // One access-memory command per word.
+        let command_writes: Vec<_> = log
+            .writes
+            .iter()
+            .filter(|(address, _)| *address == Command::get_mmio_address())
+            .collect();
+        assert_eq!(command_writes.len(), 3);
+        assert!(command_writes
+            .iter()
+            .all(|&(_, value)| *value == ACCESS_MEMORY_READ));
+    }
+
+    #[test]
+    fn abstract_write_multiple_pinned() {
+        let mut state = RiscvCommunicationInterfaceState::new();
+        let mock = MockDtmAccess::default();
+        let log = mock.log.clone();
+        let mut interface = make_interface(mock, &mut state);
+        interface.force_memory_access_method(Some(MemoryAccessMethod::AbstractCommand));
+
+        interface
+            .write_multiple(0x3000, &[0xAAu32, 0xBB, 0xCC])
+            .unwrap();
+
+        let log = log.lock().unwrap();
+        // The start address is loaded into arg1 exactly once.
+        let arg1_writes: Vec<_> = log
+            .writes
+            .iter()
+            .filter(|(address, _)| *address == Data1::get_mmio_address())
+            .collect();
+        assert_eq!(arg1_writes.len(), 1);
+        assert_eq!(arg1_writes[0], &(Data1::get_mmio_address(), 0x3000));
+
+        // Each word's value goes through data0, in order, before its
+        // write command.
+        let data0_writes: Vec<_> = log
+            .writes
+            .iter()
+            .filter(|(address, _)| *address == Data0::get_mmio_address())
+            .map(|&(_, value)| value)
+            .collect();
+        assert_eq!(data0_writes, vec![0xAA, 0xBB, 0xCC]);
+
+        let command_writes: Vec<_> = log
+            .writes
+            .iter()
+            .filter(|(address, _)| *address == Command::get_mmio_address())
+            .map(|&(_, value)| value)
+            .collect();
+        assert_eq!(command_writes.len(), 3);
+        assert!(command_writes
+            .iter()
+            .all(|value| *value == ACCESS_MEMORY_WRITE));
+    }
+
+    #[test]
+    fn abstract_memory_access_rejects_narrow_widths() {
+        // A forced abstract method with a sub-word width must fail loudly
+        // instead of degrading into a 32-bit access that corrupts the
+        // neighbouring bytes.
+        let mut state = RiscvCommunicationInterfaceState::new();
+        let mut interface = make_interface(MockDtmAccess::default(), &mut state);
+        interface.force_memory_access_method(Some(MemoryAccessMethod::AbstractCommand));
+
+        let result = interface.read_word::<u8>(0x1000);
+        assert!(matches!(
+            result,
+            Err(crate::Error::Riscv(RiscvError::UnsupportedBusAccessWidth(
+                RiscvBusAccess::A8
+            )))
+        ));
+
+        let result = interface.write_word(0x1000, 0x1Au16);
+        assert!(matches!(
+            result,
+            Err(crate::Error::Riscv(RiscvError::UnsupportedBusAccessWidth(
+                RiscvBusAccess::A16
+            )))
+        ));
+    }
+}

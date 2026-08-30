@@ -1230,6 +1230,14 @@ impl DeferredResultIndex {
         Self(Arc::new(()))
     }
 
+    /// Constructor for test doubles that implement the deferred-result
+    /// interfaces without a real command queue; the indices they hand out
+    /// are opaque tokens anyway.
+    #[cfg(test)]
+    pub(crate) fn new_for_testing() -> Self {
+        Self::new()
+    }
+
     fn id(&self) -> usize {
         Arc::as_ptr(&self.0) as usize
     }
