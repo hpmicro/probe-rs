@@ -413,6 +413,36 @@ impl Default for JtagDriverState {
     }
 }
 
+/// The on-wire TAP reset train: five TMS-high cycles reach
+/// test-logic-reset, the trailing low bit exits to idle.
+const ON_WIRE_TAP_RESET_TMS: [bool; 6] = [true, true, true, true, true, false];
+
+/// Emit the on-wire TAP reset train and flush it, so the TAP passes
+/// through test-logic-reset and the next operation starts from a known
+/// state on an empty bitstream. Shared by the [`RawJtagIo`] default and
+/// protocol-specific overrides that reset on the wire.
+pub(crate) fn run_on_wire_tap_reset<Io: RawJtagIo + ?Sized>(
+    io: &mut Io,
+) -> Result<(), DebugProbeError> {
+    tracing::debug!("Resetting JTAG chain by setting tms high for 5 bits");
+
+    io.shift_bits(
+        ON_WIRE_TAP_RESET_TMS,
+        iter::repeat(true),
+        iter::repeat(false),
+    )?;
+    let response = io.read_captured_bits()?;
+
+    tracing::debug!("Response to reset: {}", response);
+
+    // Test-Logic-Reset loads each TAP's own IDCODE instruction
+    // (IEEE 1149.1), whose opcode encoding is architecture-specific,
+    // so no single tracked value can represent the IR content.
+    io.state_mut().current_ir_reg = IR_SHADOW_INVALID;
+
+    Ok(())
+}
+
 /// A trait for implementing low-level JTAG interface operations.
 pub(crate) trait RawJtagIo {
     /// Contract for both `shift_bit` and `shift_bits`: implementations
@@ -452,23 +482,7 @@ pub(crate) trait RawJtagIo {
 
     /// Resets the JTAG state machine by shifting out a number of high TMS bits.
     fn reset_jtag_state_machine(&mut self) -> Result<(), DebugProbeError> {
-        tracing::debug!("Resetting JTAG chain by setting tms high for 5 bits");
-
-        // Reset JTAG chain (5 times TMS high), and enter idle state afterwards
-        let tms = [true, true, true, true, true, false];
-        let tdi = iter::repeat(true);
-
-        self.shift_bits(tms, tdi, iter::repeat(false))?;
-        let response = self.read_captured_bits()?;
-
-        tracing::debug!("Response to reset: {}", response);
-
-        // Test-Logic-Reset loads each TAP's own IDCODE instruction
-        // (IEEE 1149.1), whose opcode encoding is architecture-specific,
-        // so no single tracked value can represent the IR content.
-        self.state_mut().current_ir_reg = IR_SHADOW_INVALID;
-
-        Ok(())
+        run_on_wire_tap_reset(self)
     }
 
     /// Configures the probe to address the given target.
@@ -945,6 +959,94 @@ mod tests {
 
             assert!(transitions < 10);
         }
+    }
+
+    /// Records shifted bits and models the capture queue, so the on-wire
+    /// TAP reset sequence can be verified without hardware.
+    struct FakeRawJtagIo {
+        state: JtagDriverState,
+        shifted: Vec<(bool, bool, bool)>,
+        queued_bits: usize,
+        flushed_bits: usize,
+    }
+
+    impl FakeRawJtagIo {
+        fn new() -> Self {
+            Self {
+                state: JtagDriverState::default(),
+                shifted: Vec::new(),
+                queued_bits: 0,
+                flushed_bits: 0,
+            }
+        }
+    }
+
+    impl RawJtagIo for FakeRawJtagIo {
+        fn state_mut(&mut self) -> &mut JtagDriverState {
+            &mut self.state
+        }
+
+        fn state(&self) -> &JtagDriverState {
+            &self.state
+        }
+
+        fn shift_bit(
+            &mut self,
+            tms: bool,
+            tdi: bool,
+            capture: bool,
+        ) -> Result<(), DebugProbeError> {
+            self.shifted.push((tms, tdi, capture));
+            self.queued_bits += 1;
+            Ok(())
+        }
+
+        fn read_captured_bits(&mut self) -> Result<BitVec<u8, Lsb0>, DebugProbeError> {
+            self.flushed_bits += self.queued_bits;
+            self.queued_bits = 0;
+            Ok(BitVec::new())
+        }
+    }
+
+    #[test]
+    fn on_wire_reset_flushes_the_train() {
+        let mut io = FakeRawJtagIo::new();
+
+        run_on_wire_tap_reset(&mut io).unwrap();
+
+        // Exactly the reset train is emitted: five TMS-high cycles into
+        // test-logic-reset, trailing low bit to idle, TDI high, nothing
+        // captured.
+        assert_eq!(
+            io.shifted,
+            vec![
+                (true, true, false),
+                (true, true, false),
+                (true, true, false),
+                (true, true, false),
+                (true, true, false),
+                (false, true, false),
+            ]
+        );
+
+        // The train is flushed: every queued bit was consumed by
+        // read_captured_bits, so the next operation starts from an empty
+        // bitstream instead of sharing a sequence with the reset train.
+        assert_eq!(io.queued_bits, 0);
+        assert_eq!(io.flushed_bits, 6);
+    }
+
+    #[test]
+    fn raw_jtag_io_default_reset_uses_the_shared_helper() {
+        // The trait default must route through the same shared sequence as
+        // protocol-specific overrides, so a flush regression breaks both.
+        let mut io = FakeRawJtagIo::new();
+
+        RawJtagIo::reset_jtag_state_machine(&mut io).unwrap();
+
+        assert_eq!(io.shifted.len(), 6);
+        assert_eq!(io.queued_bits, 0);
+        assert_eq!(io.flushed_bits, 6);
     }
 }
 

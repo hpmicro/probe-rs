@@ -23,7 +23,7 @@ use crate::{
             general::info::{CapabilitiesCommand, PacketCountCommand, SWOTraceBufferSizeCommand},
             CmsisDapError,
         },
-        common::{JtagDriverState, RawJtagIo},
+        common::{run_on_wire_tap_reset, JtagDriverState, JtagState, RawJtagIo},
         BatchCommand, DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector, JTAGAccess,
         JtagChainItem, ProbeFactory, WireProtocol,
     },
@@ -1282,8 +1282,26 @@ impl RawJtagIo for CmsisDap {
     fn state_mut(&mut self) -> &mut JtagDriverState {
         &mut self.jtag_driver_state
     }
+
+    fn reset_jtag_state_machine(&mut self) -> Result<(), DebugProbeError> {
+        match tap_reset_kind(self.protocol) {
+            TapResetKind::SoftwareOnly => {
+                // cJTAG: the probe firmware establishes OScan1 during
+                // DAP_Connect and parks the TAP at idle; no on-wire TAP reset
+                // is needed, and a merged multi-bit TMS-high train would be
+                // silently truncated by the firmware anyway. Synchronize the
+                // software state machine only.
+                tracing::debug!("cJTAG: skipping on-wire TAP reset");
+                apply_tap_reset(&mut self.jtag_driver_state, TapResetKind::SoftwareOnly);
+                Ok(())
+            }
+            TapResetKind::OnWire => run_on_wire_tap_reset(self),
+        }
+    }
+
     fn shift_bit(&mut self, tms: bool, tdi: bool, capture: bool) -> Result<(), DebugProbeError> {
         shift_bit_with(
+            self.protocol,
             tms,
             tdi,
             capture,
@@ -1300,6 +1318,7 @@ impl RawJtagIo for CmsisDap {
         cap: impl IntoIterator<Item = bool>,
     ) -> Result<(), DebugProbeError> {
         encode_shift_bits_with(
+            self.protocol,
             tms,
             tdi,
             cap,
@@ -1579,6 +1598,7 @@ fn read_captured_bits_pipelined(
 /// serve as the reference side of the batch encoder's differential
 /// tests.
 pub(crate) fn shift_bit_with(
+    protocol: Option<WireProtocol>,
     tms: bool,
     tdi: bool,
     capture: bool,
@@ -1586,10 +1606,12 @@ pub(crate) fn shift_bit_with(
     state: &mut JtagDriverState,
 ) {
     state.state.update(tms);
-    let merged = queue
-        .last_mut()
-        .map(|seq| seq.append(tms, tdi, capture).is_ok())
-        .unwrap_or(false);
+    let mergeable = may_merge_tms_bit(protocol, tms);
+    let merged = mergeable
+        && queue
+            .last_mut()
+            .map(|seq| seq.append(tms, tdi, capture).is_ok())
+            .unwrap_or(false);
     if !merged {
         queue.push(
             JtagSequence::new(1, capture, tms, [u8::from(tdi), 0, 0, 0, 0, 0, 0, 0])
@@ -1607,6 +1629,7 @@ pub(crate) fn shift_bit_with(
 /// stretch packs its TDI bits straight into the sequence data bytes at
 /// run granularity, which removes the per-clock host cost.
 pub(crate) fn encode_shift_bits_with<I1, I2, I3>(
+    protocol: Option<WireProtocol>,
     tms: I1,
     tdi: I2,
     cap: I3,
@@ -1620,20 +1643,29 @@ pub(crate) fn encode_shift_bits_with<I1, I2, I3>(
     let mut run: Option<(bool, bool, [u8; 8], usize)> = None;
     for ((tms, tdi), cap) in tms.into_iter().zip(tdi).zip(cap) {
         state.state.update(tms);
+        let mergeable = may_merge_tms_bit(protocol, tms);
         match &mut run {
-            Some((r_tms, r_cap, bits, len)) if *r_tms == tms && *r_cap == cap && *len < 64 => {
+            Some((r_tms, r_cap, bits, len))
+                if mergeable && *r_tms == tms && *r_cap == cap && *len < 64 =>
+            {
                 bits[*len / 8] |= u8::from(tdi) << (*len % 8);
                 *len += 1;
             }
             _ => {
-                flush_run(run.take(), queue);
+                if mergeable {
+                    flush_run(protocol, run.take(), queue);
+                } else {
+                    // A non-mergeable clock must not join the pending run
+                    // nor the queue tail: emit it as its own sequence.
+                    flush_run(protocol, run.take(), queue);
+                }
                 let mut bits = [0u8; 8];
                 bits[0] = u8::from(tdi);
                 run = Some((tms, cap, bits, 1));
             }
         }
     }
-    flush_run(run.take(), queue);
+    flush_run(protocol, run.take(), queue);
 }
 
 /// Commit one completed (tms, capture) run into the queue with per-clock
@@ -1641,14 +1673,20 @@ pub(crate) fn encode_shift_bits_with<I1, I2, I3>(
 /// remaining 64-clock capacity, and the remainder becomes a fresh
 /// sequence. A committed run never exceeds 64 clocks, so at most one
 /// fresh sequence is created.
-fn flush_run(run: Option<(bool, bool, [u8; 8], usize)>, queue: &mut Vec<JtagSequence>) {
+fn flush_run(
+    protocol: Option<WireProtocol>,
+    run: Option<(bool, bool, [u8; 8], usize)>,
+    queue: &mut Vec<JtagSequence>,
+) {
     let Some((tms, cap, bits, mut len)) = run else {
         return;
     };
     let mut taken = 0;
-    if let Some(tail) = queue.last_mut() {
-        taken = tail.append_bits(tms, cap, &bits, len);
-        len -= taken;
+    if may_merge_tms_bit(protocol, tms) {
+        if let Some(tail) = queue.last_mut() {
+            taken = tail.append_bits(tms, cap, &bits, len);
+            len -= taken;
+        }
     }
     if len > 0 {
         let mut shifted = [0u8; 8];
@@ -1669,6 +1707,150 @@ impl From<ScanChainError> for CmsisDapError {
             ScanChainError::InvalidIdCode => CmsisDapError::InvalidIdCode,
             ScanChainError::InvalidIR => CmsisDapError::InvalidIR,
         }
+    }
+}
+
+/// cJTAG firmware contract: within a DAP_JTAG_SEQUENCE the firmware only
+/// processes the first bit of a TMS-high sequence and silently drops the
+/// rest, so TMS-high bits must each be sent as single-cycle sequences.
+/// TMS-low (data) bits may merge freely.
+fn may_merge_tms_bit(protocol: Option<WireProtocol>, tms: bool) -> bool {
+    !(protocol == Some(WireProtocol::CJtag) && tms)
+}
+
+/// How the TAP reset is performed for the active protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TapResetKind {
+    /// Software-only state resynchronisation (cJTAG).
+    SoftwareOnly,
+    /// On-wire reset train (4-pin JTAG and protocol-less use).
+    OnWire,
+}
+
+/// cJTAG parks the TAP at idle during activation and truncates merged
+/// TMS-high runs, so its TAP reset stays in software; every other
+/// protocol resets the TAP on the wire.
+fn tap_reset_kind(protocol: Option<WireProtocol>) -> TapResetKind {
+    match protocol {
+        Some(WireProtocol::CJtag) => TapResetKind::SoftwareOnly,
+        _ => TapResetKind::OnWire,
+    }
+}
+
+/// Software half of a TAP reset: park the tracked state at idle without
+/// emitting wire traffic. The on-wire kind parks the state through the
+/// reset train itself.
+fn apply_tap_reset(state: &mut JtagDriverState, kind: TapResetKind) {
+    if kind == TapResetKind::SoftwareOnly {
+        state.state = JtagState::Idle;
+    }
+}
+
+/// Append a single bit to the sequence buffer, merging into the previous
+/// sequence when the protocol permits it (see [`may_merge_tms_bit`]).
+fn push_shift_bit(
+    sequences: &mut Vec<JtagSequence>,
+    protocol: Option<WireProtocol>,
+    tms: bool,
+    tdi: bool,
+    capture: bool,
+) -> Result<(), DebugProbeError> {
+    if may_merge_tms_bit(protocol, tms) {
+        if let Some(sequence) = sequences.last_mut() {
+            if sequence.append(tms, tdi, capture).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+    sequences.push(JtagSequence::new(
+        1,
+        capture,
+        tms,
+        [u8::from(tdi), 0, 0, 0, 0, 0, 0, 0],
+    )?);
+    Ok(())
+}
+
+#[cfg(test)]
+mod cjtag_tests {
+    use super::*;
+
+    #[test]
+    fn tms_high_bits_never_merge_in_cjtag() {
+        assert!(!may_merge_tms_bit(Some(WireProtocol::CJtag), true));
+        assert!(may_merge_tms_bit(Some(WireProtocol::CJtag), false));
+        assert!(may_merge_tms_bit(Some(WireProtocol::Jtag), true));
+        assert!(may_merge_tms_bit(None, true));
+    }
+
+    #[test]
+    fn cjtag_tap_reset_is_software_only() {
+        assert_eq!(
+            tap_reset_kind(Some(WireProtocol::CJtag)),
+            TapResetKind::SoftwareOnly
+        );
+    }
+
+    #[test]
+    fn four_pin_tap_reset_runs_on_wire() {
+        assert_eq!(
+            tap_reset_kind(Some(WireProtocol::Jtag)),
+            TapResetKind::OnWire
+        );
+        assert_eq!(tap_reset_kind(None), TapResetKind::OnWire);
+        assert_eq!(
+            tap_reset_kind(Some(WireProtocol::Swd)),
+            TapResetKind::OnWire
+        );
+    }
+
+    #[test]
+    fn apply_tap_reset_parks_state_at_idle_without_wire_traffic() {
+        // The software-only reset touches the tracked state and nothing
+        // else: no sequence is queued, so no wire traffic can result.
+        let mut state = JtagDriverState::default();
+        apply_tap_reset(&mut state, TapResetKind::SoftwareOnly);
+        assert_eq!(state.state, JtagState::Idle);
+    }
+
+    #[test]
+    fn cjtag_tms_high_run_stays_single_bit_sequences() {
+        // Under cJTAG a TMS-high run must produce one single-bit sequence
+        // per bit; under 4-pin JTAG the same run merges into one sequence.
+        let train = [
+            (true, true),
+            (true, true),
+            (true, true),
+            (true, true),
+            (true, true),
+            (false, true),
+        ];
+
+        let mut cjtag_sequences = Vec::new();
+        for (tms, tdi) in train {
+            push_shift_bit(
+                &mut cjtag_sequences,
+                Some(WireProtocol::CJtag),
+                tms,
+                tdi,
+                false,
+            )
+            .unwrap();
+        }
+        assert_eq!(cjtag_sequences.len(), 6);
+
+        let mut jtag_sequences = Vec::new();
+        for (tms, tdi) in train {
+            push_shift_bit(
+                &mut jtag_sequences,
+                Some(WireProtocol::Jtag),
+                tms,
+                tdi,
+                false,
+            )
+            .unwrap();
+        }
+        assert!(jtag_sequences.len() < 6);
     }
 }
 
@@ -1952,7 +2134,7 @@ mod batch_encode_tests {
         let mut queue = Vec::new();
         let mut state = JtagDriverState::default();
         for &(tms, tdi, cap) in clocks {
-            shift_bit_with(tms, tdi, cap, &mut queue, &mut state);
+            shift_bit_with(None, tms, tdi, cap, &mut queue, &mut state);
         }
         (queue, state)
     }
@@ -1961,6 +2143,7 @@ mod batch_encode_tests {
         let mut queue = Vec::new();
         let mut state = JtagDriverState::default();
         encode_shift_bits_with(
+            None,
             clocks.iter().map(|c| c.0),
             clocks.iter().map(|c| c.1),
             clocks.iter().map(|c| c.2),
@@ -2049,7 +2232,7 @@ mod batch_encode_tests {
             let mut rq = Vec::new();
             let mut rs = JtagDriverState::default();
             for _ in 0..tail {
-                shift_bit_with(false, false, false, &mut rq, &mut rs);
+                shift_bit_with(None, false, false, false, &mut rq, &mut rs);
             }
             let mut bq = rq.clone();
             let mut bs = JtagDriverState::default();
@@ -2057,9 +2240,10 @@ mod batch_encode_tests {
             let run: Vec<(bool, bool, bool)> =
                 (0..100).map(|i| (false, i % 3 == 0, false)).collect();
             for &(tms, tdi, cap) in &run {
-                shift_bit_with(tms, tdi, cap, &mut rq, &mut rs);
+                shift_bit_with(None, tms, tdi, cap, &mut rq, &mut rs);
             }
             encode_shift_bits_with(
+                None,
                 run.iter().map(|c| c.0),
                 run.iter().map(|c| c.1),
                 run.iter().map(|c| c.2),
@@ -2082,6 +2266,7 @@ mod batch_encode_tests {
         let mut bq = Vec::new();
         let mut bs = JtagDriverState::default();
         encode_shift_bits_with(
+            None,
             tms,
             std::iter::repeat(false),
             std::iter::repeat(false),
