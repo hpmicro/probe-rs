@@ -57,4 +57,41 @@ pub trait DtmAccess: Send + fmt::Debug {
 
     /// Returns an idcode used for chip detection
     fn read_idcode(&mut self) -> Result<Option<u32>, DebugProbeError>;
+
+    /// Schedule a DMI read whose response bypasses the standard
+    /// status-check transform. The deferred result carries the raw scan
+    /// capture as bytes; the caller extracts the op field (bits [1:0]) and
+    /// the data field (bits [33:2]) itself. The returned index is captured,
+    /// so the response of this scan is the result of the *previous* DMI
+    /// operation, not of this read request.
+    ///
+    /// Intended for sequences that manage their own recovery protocol
+    /// (e.g. the system-bus read pipeline experiments, where a busy
+    /// status requires re-arming the address register rather than a
+    /// DTM reset).
+    #[doc(hidden)]
+    fn schedule_raw_read(&mut self, _address: u64) -> Result<DeferredResultIndex, RiscvError> {
+        Err(RiscvError::DebugProbe(DebugProbeError::NotImplemented {
+            function_name: "schedule_raw_read",
+        }))
+    }
+
+    /// Schedule a DMI no-op with a captured raw response, same contract as
+    /// [`DtmAccess::schedule_raw_read`].
+    #[doc(hidden)]
+    fn schedule_raw_noop(&mut self) -> Result<DeferredResultIndex, RiscvError> {
+        Err(RiscvError::DebugProbe(DebugProbeError::NotImplemented {
+            function_name: "schedule_raw_noop",
+        }))
+    }
+
+    /// Schedule a DMI read whose response is discarded (not captured). Used
+    /// to push a request into the DMI pipeline when only its side effect
+    /// (e.g. triggering a system-bus access) matters.
+    #[doc(hidden)]
+    fn schedule_raw_read_uncaptured(&mut self, _address: u64) -> Result<(), RiscvError> {
+        Err(RiscvError::DebugProbe(DebugProbeError::NotImplemented {
+            function_name: "schedule_raw_read_uncaptured",
+        }))
+    }
 }
