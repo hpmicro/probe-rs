@@ -6,8 +6,8 @@
 
 use crate::architecture::riscv::dtm::dtm_access::DtmAccess;
 use crate::{
-    architecture::riscv::*, memory_mapped_bitfield_register, probe::DeferredResultIndex,
-    Error as ProbeRsError,
+    architecture::riscv::*, memory_mapped_bitfield_register, probe::CommandResult,
+    probe::DeferredResultIndex, Error as ProbeRsError,
 };
 use std::any::Any;
 use std::collections::HashMap;
@@ -77,6 +77,60 @@ impl From<RiscvError> for ProbeRsError {
             RiscvError::DebugProbe(e) => e.into(),
             other => ProbeRsError::Riscv(other),
         }
+    }
+}
+
+/// One raw DMI scan response, decoded from the capture: the 32-bit data
+/// field (bits [33:2]) and the 2-bit op status (bits [1:0]) of the DMI
+/// operation that the scan's predecessor requested. `raw` carries the
+/// unmodified capture bytes for bit-level diagnosis.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct RawDmiResponse {
+    pub data: u32,
+    pub op: u8,
+    pub raw: Vec<u8>,
+}
+
+/// Role of a captured scan within a system-bus read sequence: which
+/// system-bus word its response carries, or why it carries none.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub enum ScanRole {
+    /// Response holds `Sbdata0` for system-bus word #0 (the word at the
+    /// sequence address), word #1, and so on.
+    Data(usize),
+    /// Response is the result of a filler no-op or a priming read and
+    /// carries no meaningful data.
+    Ignored,
+}
+
+/// A captured scan: its decoded response and its role in the sequence.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct ScanOutcome {
+    pub response: RawDmiResponse,
+    pub role: ScanRole,
+}
+
+/// Decode a raw DMI scan capture into its op and data fields. The 41-bit
+/// DMI response places the op status in bits [1:0] and the data in
+/// bits [33:2].
+#[doc(hidden)]
+pub fn decode_raw_response(result: CommandResult) -> Result<RawDmiResponse, RiscvError> {
+    match result {
+        CommandResult::VecU8(bytes) => {
+            let value: u128 = bytes
+                .iter()
+                .enumerate()
+                .fold(0u128, |acc, (i, b)| acc | ((*b as u128) << (8 * i)));
+            Ok(RawDmiResponse {
+                data: (value >> 2) as u32,
+                op: (value & 0x3) as u8,
+                raw: bytes,
+            })
+        }
+        _ => Err(RiscvError::BatchedResultNotAvailable),
     }
 }
 
@@ -269,6 +323,44 @@ const ACCESS_MEMORY_WRITE: u32 = ACCESS_MEMORY_READ | 1 << 16;
 /// buffer reads from: a flash load takes many more cycles than a RAM
 /// load, and one giant queue overruns the debug module.
 const WORDS_PER_BATCH: usize = 32;
+
+/// Words per system-bus read batch (one DMI queue flush). Each word
+/// costs one 41-bit scan; the driver splits a flush across USB
+/// transfers and the per-sequence capture slicing keeps responses
+/// aligned across the split, so this bound only trades memory against
+/// recovery granularity.
+const SYSBUS_BATCH_WORDS: usize = 64;
+
+/// Polls of `sbcs.sbbusy` before a batch tail is declared stuck.
+const SBBUSY_POLL_LIMIT: usize = 20;
+
+/// Word layout of one system-bus read batch: how many words it covers
+/// and where it starts, in output slots and in bytes from the range
+/// start.
+#[derive(Debug, PartialEq, Eq)]
+struct SysbusBatchPlan {
+    word_count: usize,
+    word_offset: usize,
+    address_offset_bytes: u32,
+}
+
+/// Split a system-bus read of `word_count` words into batches of at most
+/// [`SYSBUS_BATCH_WORDS`] words, each with its output offset and its
+/// byte distance from the range start.
+fn sysbus_batch_partition(word_count: usize, byte_width: u32) -> Vec<SysbusBatchPlan> {
+    let mut plans = Vec::new();
+    let mut offset = 0usize;
+    while offset < word_count {
+        let take = (word_count - offset).min(SYSBUS_BATCH_WORDS);
+        plans.push(SysbusBatchPlan {
+            word_count: take,
+            word_offset: offset,
+            address_offset_bytes: (offset as u32) * byte_width,
+        });
+        offset += take;
+    }
+    plans
+}
 
 impl RiscvCommunicationInterfaceState {
     /// Create a new interface state.
@@ -766,20 +858,7 @@ impl<'state> RiscvCommunicationInterface<'state> {
     ///
     /// Use the [`read_dm_register`] function if possible.
     fn read_dm_register_untyped(&mut self, address: u64) -> Result<u32, RiscvError> {
-        self.dtm
-            .read_with_timeout(address, Duration::from_millis(1000))
-    }
-
-    /// Clear the sticky system-bus error bits. Both `sberror` and
-    /// `sbbusyerror` survive until written back with ones, and with
-    /// them set every further system bus access fails before it starts
-    /// - so errors are cleared both before first use and before they
-    /// are reported.
-    fn clear_system_bus_errors(&mut self) -> Result<(), RiscvError> {
-        let mut clear = Sbcs(0);
-        clear.set_sberror(0b111);
-        clear.set_sbbusyerror(true);
-        self.write_dm_register(clear)
+        self.dtm.read_with_timeout(address, Duration::from_millis(1000))
     }
 
     pub(crate) fn write_dm_register<R: MemoryMappedRegister<u32>>(
@@ -865,6 +944,19 @@ impl<'state> RiscvCommunicationInterface<'state> {
     }
 
     /// Perform a single read from a memory location, using system bus access.
+
+    /// Clear the sticky system-bus error bits. Both `sberror` and
+    /// `sbbusyerror` survive until written back with ones, and with
+    /// them set every further system bus access fails before it starts
+    /// - so errors are cleared both before first use and before they
+    /// are reported.
+    fn clear_system_bus_errors(&mut self) -> Result<(), RiscvError> {
+        let mut clear = Sbcs(0);
+        clear.set_sberror(0b111);
+        clear.set_sbbusyerror(true);
+        self.write_dm_register(clear)
+    }
+
     fn perform_memory_read_sysbus<V: RiscvValue32>(
         &mut self,
         address: u32,
@@ -890,9 +982,47 @@ impl<'state> RiscvCommunicationInterface<'state> {
         }
     }
 
+    /// Number of DMI scans a system-bus batch read of `word_count` words
+    /// queues: one priming read, `word_count - 2` captured reads, and one
+    /// captured no-op tail. The last word of the range is collected after
+    /// the batch (engine stopped), so a single word needs no scan at all.
+    fn sysbus_batch_scan_count(word_count: usize) -> usize {
+        match word_count {
+            0 | 1 => 0,
+            n => n,
+        }
+    }
+
+    /// Fill `data` from captured scan outcomes by scan role. Any non-Ok
+    /// op status invalidates the pipeline from that scan on (a stalled
+    /// scan shifts every later response), so it is an error rather than
+    /// skipped data.
+    fn sysbus_batch_data_from_scans<V: RiscvValue32>(
+        scans: &[ScanOutcome],
+        data: &mut [V],
+    ) -> Result<(), RiscvError> {
+        for scan in scans {
+            if let ScanRole::Data(index) = scan.role {
+                if scan.response.op != 0 {
+                    return Err(RiscvError::SystemBusAccess);
+                }
+                data[index] = V::from_register_value(scan.response.data);
+            }
+        }
+        Ok(())
+    }
+
     /// Perform multiple reads from consecutive memory locations
     /// using system bus access.
     /// Only reads up to a width of 32 bits are currently supported.
+    ///
+    /// The words are read as one `sbreadondata` pipeline per DMI queue
+    /// flush: an uncaptured priming read pushes the first access result
+    /// into the DMI pipeline, captured read scans carry consecutive words,
+    /// and a captured no-op tail ends the batch without triggering an
+    /// access past the range. The final word is collected after the
+    /// engine is stopped, so a range read performs exactly one bus access
+    /// per word.
     fn perform_memory_read_multiple_sysbus<V: RiscvValue32>(
         &mut self,
         address: u32,
@@ -902,51 +1032,129 @@ impl<'state> RiscvCommunicationInterface<'state> {
             return Ok(());
         }
 
-        let mut sbcs = Sbcs(0);
+        let byte_width = V::WIDTH.byte_width() as u32;
+        for plan in sysbus_batch_partition(data.len(), byte_width) {
+            let batch = &mut data[plan.word_offset..plan.word_offset + plan.word_count];
 
-        sbcs.set_sbaccess(V::WIDTH as u32);
+            // Re-arm the pipeline for every batch: the previous batch's
+            // tail collection left readondata and autoincrement off.
+            let mut sbcs = Sbcs(0);
+            sbcs.set_sbaccess(V::WIDTH as u32);
+            sbcs.set_sbreadonaddr(true);
+            sbcs.set_sbreadondata(true);
+            sbcs.set_sbautoincrement(true);
+            self.write_dm_register(sbcs)?;
 
-        sbcs.set_sbreadonaddr(true);
+            // The address write triggers access #1 of this batch.
+            self.write_dm_register(Sbaddress0(address + plan.address_offset_bytes))?;
 
-        sbcs.set_sbreadondata(true);
-        sbcs.set_sbautoincrement(true);
+            let scans_needed = Self::sysbus_batch_scan_count(batch.len());
+            if scans_needed > 0 {
+                // Priming read: its own response is the address-write
+                // ack; it pushes the first word into the DMI pipeline.
+                self.dtm
+                    .schedule_raw_read_uncaptured(Sbdata::R0_ADDRESS as u64)?;
 
-        self.schedule_write_dm_register(sbcs)?;
+                // Scan k (1-based) carries data[k - 1]. Scans before the
+                // tail are reads (each triggers the next access); the
+                // final scan is a captured no-op so the batch ends with-
+                // out triggering an access beyond the range.
+                let tail = scans_needed - 1;
+                let mut indices = Vec::with_capacity(tail);
+                for k in 1..=tail {
+                    let index = if k < tail {
+                        self.dtm.schedule_raw_read(Sbdata::R0_ADDRESS as u64)?
+                    } else {
+                        self.dtm.schedule_raw_noop()?
+                    };
+                    indices.push((index, ScanRole::Data(k - 1)));
+                }
 
-        self.schedule_write_dm_register(Sbaddress0(address))?;
+                self.dtm.execute()?;
 
-        let data_len = data.len();
-
-        for i in 0..data_len - 1 {
-            data[i] = self.read_large_dtm_register::<V, Sbdata>()?;
-        }
-
-        // Writing sbcs while the last pipelined read is still in flight
-        // is undefined behavior (the spec requires sbbusy to read 0
-        // first), and on this DM it latches a sticky sberror that
-        // blocks all further system bus accesses. Wait for the bus to
-        // settle before reconfiguring.
-        for _ in 0..1000 {
-            if !self.read_dm_register::<Sbcs>()?.sbbusy() {
-                break;
+                let fill_len = batch.len() - 1;
+                if let Err(e) = self.sysbus_collect_scans::<V>(indices, &mut batch[..fill_len]) {
+                    // Leave the engine safe for a caller retry: wait out
+                    // sbbusy, then turn the access-triggering bits off.
+                    // A retry writing sbcs while the engine is busy is
+                    // undefined behavior per the SBCS contract.
+                    self.sysbus_abandon_batch(V::WIDTH as u32)?;
+                    return Err(e);
+                }
             }
+
+            // Two-phase tail: the last access of the batch was triggered
+            // by the final read scan; wait it out, stop the engine so
+            // reading SBDATA0 triggers nothing, then collect the word.
+            let mut status = self.read_dm_register::<Sbcs>()?;
+            let mut polls = 0;
+            while status.sbbusy() && polls < SBBUSY_POLL_LIMIT {
+                status = self.read_dm_register::<Sbcs>()?;
+                polls += 1;
+            }
+            if status.sbbusy() {
+                return Err(RiscvError::SystemBusAccess);
+            }
+
+            let mut stop = Sbcs(0);
+            stop.set_sbaccess(V::WIDTH as u32);
+            stop.set_sbreadondata(false);
+            stop.set_sbautoincrement(false);
+            self.write_dm_register(stop)?;
+
+            batch[batch.len() - 1] = self.read_large_dtm_register::<V, Sbdata>()?;
         }
 
-        sbcs.set_sbautoincrement(false);
-        self.write_dm_register(sbcs)?;
-
-        // Read last value
-        data[data_len - 1] = self.read_large_dtm_register::<V, Sbdata>()?;
-
-        let sbcs = self.read_dm_register::<Sbcs>()?;
-
-        // Check that the read was succesful
-        if sbcs.sberror() != 0 {
-            self.clear_system_bus_errors()?;
-            Err(RiscvError::SystemBusAccess)
-        } else {
-            Ok(())
+        // Final status check; both sticky bits are cleared on error so a
+        // failed read does not poison later system-bus work.
+        let final_status: Sbcs = self.read_dm_register()?;
+        if final_status.sberror() != 0 || final_status.sbbusyerror() {
+            let mut clear = Sbcs(0);
+            clear.set_sberror(final_status.sberror());
+            clear.set_sbbusyerror(final_status.sbbusyerror());
+            self.write_dm_register(clear)?;
+            return Err(RiscvError::SystemBusAccess);
         }
+        Ok(())
+    }
+
+    /// Collect a batch's deferred scan responses and lay the decoded
+    /// words into `batch`. Errors surface a stalled or failed pipeline
+    /// member instead of shifted data.
+    fn sysbus_collect_scans<V: RiscvValue32>(
+        &mut self,
+        indices: Vec<(DeferredResultIndex, ScanRole)>,
+        batch: &mut [V],
+    ) -> Result<(), RiscvError> {
+        let mut scans = Vec::with_capacity(indices.len());
+        for (index, role) in indices {
+            let response = decode_raw_response(self.dtm.read_deferred_result(index)?)?;
+            scans.push(ScanOutcome { response, role });
+        }
+        Self::sysbus_batch_data_from_scans(&scans, batch)
+    }
+
+    /// Leave the system-bus engine in a safe state after a failed batch:
+    /// wait (bounded) for sbbusy to clear, then turn the access-triggering
+    /// bits off. Writing sbcs while the engine is busy is undefined
+    /// behavior per the SBCS contract, so a wedged engine is reported
+    /// instead of being written against.
+    fn sysbus_abandon_batch(&mut self, width: u32) -> Result<(), RiscvError> {
+        let mut status = self.read_dm_register::<Sbcs>()?;
+        let mut polls = 0;
+        while status.sbbusy() && polls < SBBUSY_POLL_LIMIT {
+            status = self.read_dm_register()?;
+            polls += 1;
+        }
+        if status.sbbusy() {
+            return Err(RiscvError::SystemBusAccess);
+        }
+
+        let mut stop = Sbcs(0);
+        stop.set_sbaccess(width);
+        stop.set_sbreadondata(false);
+        stop.set_sbautoincrement(false);
+        self.write_dm_register(stop)
     }
 
     /// Perform memory reads using the abstract access-memory command
@@ -1173,7 +1381,6 @@ impl<'state> RiscvCommunicationInterface<'state> {
         let sbcs = self.read_dm_register::<Sbcs>()?;
 
         if sbcs.sberror() != 0 {
-            self.clear_system_bus_errors()?;
             Err(RiscvError::SystemBusAccess)
         } else {
             Ok(())
@@ -1650,6 +1857,14 @@ impl<'state> RiscvCommunicationInterface<'state> {
         self.dtm.schedule_read(address)
     }
 
+    fn schedule_read_large_dtm_register<V, R>(&mut self) -> Result<DeferredResultIndex, RiscvError>
+    where
+        V: RiscvValue,
+        R: LargeRegister,
+    {
+        V::schedule_read_from_register::<R>(self)
+    }
+
     fn read_large_dtm_register<V, R>(&mut self) -> Result<V, RiscvError>
     where
         V: RiscvValue,
@@ -1755,9 +1970,9 @@ impl<'state> RiscvCommunicationInterface<'state> {
             if readback.allhavereset() && readback.allhalted() {
                 break;
             }
-
+            
             if start.elapsed() > timeout {
-                tracing::debug!("reset_hart_and_halt: reset not acknowledged in time");
+                println!("reset_hart_and_halt");
                 return Err(RiscvError::RequestNotAcknowledged);
             }
         }
@@ -1844,6 +2059,12 @@ impl RiscvValue32 for u32 {
 pub(crate) trait RiscvValue: std::fmt::Debug + Copy + Sized {
     const WIDTH: RiscvBusAccess;
 
+    fn schedule_read_from_register<R>(
+        interface: &mut RiscvCommunicationInterface,
+    ) -> Result<DeferredResultIndex, RiscvError>
+    where
+        R: LargeRegister;
+
     fn schedule_write_to_register<R>(
         interface: &mut RiscvCommunicationInterface,
         value: Self,
@@ -1861,6 +2082,15 @@ pub(crate) trait RiscvValue: std::fmt::Debug + Copy + Sized {
 impl RiscvValue for u8 {
     const WIDTH: RiscvBusAccess = RiscvBusAccess::A8;
 
+    fn schedule_read_from_register<R>(
+        interface: &mut RiscvCommunicationInterface,
+    ) -> Result<DeferredResultIndex, RiscvError>
+    where
+        R: LargeRegister,
+    {
+        interface.schedule_read_dm_register_untyped(R::R0_ADDRESS as u64)
+    }
+
     fn schedule_write_to_register<R>(
         interface: &mut RiscvCommunicationInterface,
         value: Self,
@@ -1872,20 +2102,27 @@ impl RiscvValue for u8 {
     }
 
     fn read_from_register<R>(
-        interface: &mut RiscvCommunicationInterface,
-    ) -> Result<Self, RiscvError>
-    where
-        R: LargeRegister,
+            interface: &mut RiscvCommunicationInterface,
+        ) -> Result<Self, RiscvError>
+        where
+            R: LargeRegister
     {
-        interface
-            .read_dm_register_untyped(R::R0_ADDRESS as u64)
-            .map(|x| x as u8)
+        interface.read_dm_register_untyped(R::R0_ADDRESS as u64).map(|x| x as u8)
     }
 }
 
 impl RiscvValue for u16 {
     const WIDTH: RiscvBusAccess = RiscvBusAccess::A16;
 
+    fn schedule_read_from_register<R>(
+        interface: &mut RiscvCommunicationInterface,
+    ) -> Result<DeferredResultIndex, RiscvError>
+    where
+        R: LargeRegister,
+    {
+        interface.schedule_read_dm_register_untyped(R::R0_ADDRESS as u64)
+    }
+
     fn schedule_write_to_register<R>(
         interface: &mut RiscvCommunicationInterface,
         value: Self,
@@ -1900,17 +2137,23 @@ impl RiscvValue for u16 {
         interface: &mut RiscvCommunicationInterface,
     ) -> Result<Self, RiscvError>
     where
-        R: LargeRegister,
+        R: LargeRegister
     {
-        interface
-            .read_dm_register_untyped(R::R0_ADDRESS as u64)
-            .map(|x| x as u16)
+        interface.read_dm_register_untyped(R::R0_ADDRESS as u64).map(|x| x as u16)
     }
 }
 
 impl RiscvValue for u32 {
     const WIDTH: RiscvBusAccess = RiscvBusAccess::A32;
 
+    fn schedule_read_from_register<R>(
+        interface: &mut RiscvCommunicationInterface,
+    ) -> Result<DeferredResultIndex, RiscvError>
+    where
+        R: LargeRegister,
+    {
+        interface.schedule_read_dm_register_untyped(R::R0_ADDRESS as u64)
+    }
     fn schedule_write_to_register<R>(
         interface: &mut RiscvCommunicationInterface,
         value: Self,
@@ -1925,16 +2168,24 @@ impl RiscvValue for u32 {
         interface: &mut RiscvCommunicationInterface,
     ) -> Result<Self, RiscvError>
     where
-        R: LargeRegister,
+        R: LargeRegister
     {
-        interface
-            .read_dm_register_untyped(R::R0_ADDRESS as u64)
-            .map(|x| x as u32)
+        interface.read_dm_register_untyped(R::R0_ADDRESS as u64).map(|x| x as u32)
     }
 }
 
 impl RiscvValue for u64 {
     const WIDTH: RiscvBusAccess = RiscvBusAccess::A64;
+
+    fn schedule_read_from_register<R>(
+        interface: &mut RiscvCommunicationInterface,
+    ) -> Result<DeferredResultIndex, RiscvError>
+    where
+        R: LargeRegister,
+    {
+        interface.schedule_read_dm_register_untyped(R::R1_ADDRESS as u64)?;
+        interface.schedule_read_dm_register_untyped(R::R0_ADDRESS as u64)
+    }
 
     fn schedule_write_to_register<R>(
         interface: &mut RiscvCommunicationInterface,
@@ -1956,16 +2207,28 @@ impl RiscvValue for u64 {
         interface: &mut RiscvCommunicationInterface,
     ) -> Result<Self, RiscvError>
     where
-        R: LargeRegister,
+        R: LargeRegister
     {
         let r1 = interface.read_dm_register_untyped(R::R1_ADDRESS as u64)? as u64;
         let r0 = interface.read_dm_register_untyped(R::R0_ADDRESS as u64)? as u64;
-        Ok((r1 << 32) + r0)
+        Ok((r1<<32)+r0)
     }
 }
 
 impl RiscvValue for u128 {
     const WIDTH: RiscvBusAccess = RiscvBusAccess::A128;
+
+    fn schedule_read_from_register<R>(
+        interface: &mut RiscvCommunicationInterface,
+    ) -> Result<DeferredResultIndex, RiscvError>
+    where
+        R: LargeRegister,
+    {
+        interface.schedule_read_dm_register_untyped(R::R3_ADDRESS as u64)?;
+        interface.schedule_read_dm_register_untyped(R::R2_ADDRESS as u64)?;
+        interface.schedule_read_dm_register_untyped(R::R1_ADDRESS as u64)?;
+        interface.schedule_read_dm_register_untyped(R::R0_ADDRESS as u64)
+    }
 
     fn schedule_write_to_register<R>(
         interface: &mut RiscvCommunicationInterface,
@@ -1992,13 +2255,13 @@ impl RiscvValue for u128 {
         interface: &mut RiscvCommunicationInterface,
     ) -> Result<Self, RiscvError>
     where
-        R: LargeRegister,
+        R: LargeRegister
     {
         let r3 = interface.read_dm_register_untyped(R::R3_ADDRESS as u64)? as u128;
         let r2 = interface.read_dm_register_untyped(R::R2_ADDRESS as u64)? as u128;
         let r1 = interface.read_dm_register_untyped(R::R1_ADDRESS as u64)? as u128;
         let r0 = interface.read_dm_register_untyped(R::R0_ADDRESS as u64)? as u128;
-        Ok((r3 << 96) + (r2 << 64) + (r1 << 32) + r0)
+        Ok((r3<<96)+(r2<<64)+(r1<<32)+r0)
     }
 }
 
@@ -2430,6 +2693,10 @@ pub(crate) mod test_mocks {
         pub read_responses: VecDeque<u32>,
         /// Values served by read_deferred_result, in order.
         pub deferred_results: VecDeque<u32>,
+        /// Raw captures served by read_deferred_result before
+        /// [`Self::deferred_results`], in order; models the byte
+        /// captures of raw DMI scans.
+        pub deferred_raw_results: VecDeque<Vec<u8>>,
         /// Value reported by abstractcs reads once data reads have been
         /// scheduled; models a busy or failed command state that appears
         /// with the first batch's completion.
@@ -2439,11 +2706,9 @@ pub(crate) mod test_mocks {
     }
 
     impl MockDtmAccess {
-        pub fn with_read_responses(responses: impl IntoIterator<Item = u32>) -> Self {
-            Self {
-                read_responses: responses.into_iter().collect(),
-                ..Default::default()
-            }
+        pub fn with_read_responses(mut self, responses: impl IntoIterator<Item = u32>) -> Self {
+            self.read_responses = responses.into_iter().collect();
+            self
         }
 
         /// Script the abstractcs value reported once data reads have been
@@ -2460,6 +2725,16 @@ pub(crate) mod test_mocks {
             self
         }
 
+        /// Provide the raw captures served by read_deferred_result, in
+        /// order; raw scans consume these before the u32 queue.
+        pub fn with_deferred_raw_results(
+            mut self,
+            results: impl IntoIterator<Item = Vec<u8>>,
+        ) -> Self {
+            self.deferred_raw_results = results.into_iter().collect();
+            self
+        }
+
         fn record_write(&mut self, address: u64, value: u32) {
             let mut log = self.log.lock().unwrap();
             log.writes.push((address, value));
@@ -2467,14 +2742,22 @@ pub(crate) mod test_mocks {
         }
 
         /// Apply a register write with hardware-accurate semantics where
-        /// they matter: abstractcs.cmderr is write-one-to-clear, so the
-        /// error-clear writes the command machinery issues do not pollute
-        /// the readable state.
+        /// they matter: abstractcs.cmderr, and sbcs sberror/sbbusyerror,
+        /// are write-one-to-clear, so error-clear writes and plain
+        /// re-configuration writes do not silently wipe sticky errors.
         fn commit_register_write(&mut self, address: u64, value: u32) {
             if address == super::Abstractcs::get_mmio_address() {
                 let entry = self.registers.entry(address).or_insert(0);
                 let remaining_cmderr = (*entry >> 8) & !((value >> 8) & 0x7);
                 *entry = (*entry & !(0x7 << 8)) | (remaining_cmderr << 8);
+            } else if address == super::Sbcs::get_mmio_address() {
+                let entry = self.registers.entry(address).or_insert(0);
+                let kept_sberror = (*entry >> 12) & !((value >> 12) & 0x7);
+                let kept_sbbusyerror = ((*entry >> 22) & 1) & !((value >> 22) & 1);
+                let merged = (value & !(0x7 << 12) & !(1 << 22))
+                    | (kept_sberror << 12)
+                    | (kept_sbbusyerror << 22);
+                *entry = merged;
             } else {
                 self.registers.insert(address, value);
             }
@@ -2508,6 +2791,9 @@ pub(crate) mod test_mocks {
             &mut self,
             _index: DeferredResultIndex,
         ) -> Result<CommandResult, RiscvError> {
+            if let Some(bytes) = self.deferred_raw_results.pop_front() {
+                return Ok(CommandResult::VecU8(bytes));
+            }
             self.deferred_results
                 .pop_front()
                 .map(CommandResult::U32)
@@ -2561,11 +2847,13 @@ pub(crate) mod test_mocks {
             {
                 return Ok(self.abstractcs_after_data_reads.unwrap());
             }
-            // Scripted responses model memory data arriving in data0; the
-            // command machinery's own register reads (dmcontrol,
-            // abstractcs) see the plain register map so commands complete
-            // immediately and cleanly.
-            if address == super::Data0::get_mmio_address() {
+            // Scripted responses model memory data arriving in data0 or
+            // sbdata0; the command machinery's own register reads
+            // (dmcontrol, abstractcs) see the plain register map so
+            // commands complete immediately and cleanly.
+            if address == super::Data0::get_mmio_address()
+                || address == super::Sbdata0::get_mmio_address()
+            {
                 if let Some(value) = self.read_responses.pop_front() {
                     return Ok(value);
                 }
@@ -2697,7 +2985,7 @@ mod tests {
         // completes against the mock instead of panicking.
         let mut state = RiscvCommunicationInterfaceState::new();
         let mut interface = make_interface(
-            MockDtmAccess::with_read_responses([0x11, 0x22, 0x33]),
+            MockDtmAccess::default().with_read_responses([0x11, 0x22, 0x33]),
             &mut state,
         );
         interface.force_memory_access_method(Some(MemoryAccessMethod::AbstractCommand));
@@ -2719,7 +3007,7 @@ mod tests {
     #[test]
     fn abstract_read_multiple_writes_arg1_once() {
         let mut state = RiscvCommunicationInterfaceState::new();
-        let mock = MockDtmAccess::with_read_responses([10, 20, 30]);
+        let mock = MockDtmAccess::default().with_read_responses([10, 20, 30]);
         let log = mock.log.clone();
         let mut interface = make_interface(mock, &mut state);
         interface.force_memory_access_method(Some(MemoryAccessMethod::AbstractCommand));
@@ -2968,5 +3256,313 @@ mod tests {
             "postexec set on the final word's command: {:#x}",
             word_reads[2]
         );
+    }
+
+    #[test]
+    fn sysbus_batch_scan_count_matches_pipeline_depth() {
+        assert_eq!(RiscvCommunicationInterface::sysbus_batch_scan_count(0), 0);
+        assert_eq!(RiscvCommunicationInterface::sysbus_batch_scan_count(1), 0);
+        assert_eq!(RiscvCommunicationInterface::sysbus_batch_scan_count(2), 2);
+        assert_eq!(RiscvCommunicationInterface::sysbus_batch_scan_count(4), 4);
+        assert_eq!(RiscvCommunicationInterface::sysbus_batch_scan_count(64), 64);
+    }
+
+    #[test]
+    fn sysbus_batch_data_from_scans_fills_by_role() {
+        let mk = |data: u32, op: u8, role: ScanRole| ScanOutcome {
+            response: RawDmiResponse {
+                data,
+                op,
+                raw: vec![],
+            },
+            role,
+        };
+        // Batch for N=4: three data-bearing scans (two reads plus the
+        // no-op tail) and one ignored filler.
+        let scans = vec![
+            mk(0xA500_0000, 0, ScanRole::Data(0)),
+            mk(0xA501_0101, 0, ScanRole::Data(1)),
+            mk(0xA702_0202, 0, ScanRole::Data(2)),
+            mk(0xdead_beef, 0, ScanRole::Ignored),
+        ];
+        let mut out = [0u32; 3];
+        RiscvCommunicationInterface::sysbus_batch_data_from_scans(&scans, &mut out).unwrap();
+        assert_eq!(out, [0xA500_0000, 0xA501_0101, 0xA702_0202]);
+    }
+
+    #[test]
+    fn sysbus_batch_data_from_scans_rejects_stalled_response() {
+        let scans = vec![ScanOutcome {
+            response: RawDmiResponse {
+                data: 1,
+                op: 3,
+                raw: vec![],
+            },
+            role: ScanRole::Data(0),
+        }];
+        let mut out = [0u32; 1];
+        assert!(
+            RiscvCommunicationInterface::sysbus_batch_data_from_scans(&scans, &mut out).is_err()
+        );
+    }
+
+    #[test]
+    fn decode_raw_response_extracts_op_and_data() {
+        // The DMI response places the data in bits [33:2] and the op
+        // status in bits [1:0]; encode data 0x1234_5678 with op 0b01.
+        let value: u128 = (0x1234_5678u64 as u128) << 2 | 0b01;
+        let bytes = value.to_le_bytes()[..6].to_vec();
+
+        let decoded = decode_raw_response(CommandResult::VecU8(bytes.clone())).unwrap();
+        assert_eq!(decoded.data, 0x1234_5678);
+        assert_eq!(decoded.op, 0b01);
+        assert_eq!(decoded.raw, bytes);
+    }
+
+    #[test]
+    fn decode_raw_response_rejects_non_byte_result() {
+        assert!(matches!(
+            decode_raw_response(CommandResult::U32(0)),
+            Err(RiscvError::BatchedResultNotAvailable)
+        ));
+    }
+
+    #[test]
+    fn sysbus_batch_partition_covers_tail_batches() {
+        let plan = |word_count, word_offset, address_offset_bytes| SysbusBatchPlan {
+            word_count,
+            word_offset,
+            address_offset_bytes,
+        };
+        assert_eq!(sysbus_batch_partition(1, 4), vec![plan(1, 0, 0)]);
+        assert_eq!(sysbus_batch_partition(2, 4), vec![plan(2, 0, 0)]);
+        assert_eq!(sysbus_batch_partition(64, 4), vec![plan(64, 0, 0)]);
+        assert_eq!(
+            sysbus_batch_partition(65, 4),
+            vec![plan(64, 0, 0), plan(1, 64, 256)]
+        );
+        // Narrower words advance the bus address proportionally.
+        assert_eq!(
+            sysbus_batch_partition(65, 2),
+            vec![plan(64, 0, 0), plan(1, 64, 128)]
+        );
+    }
+
+    #[test]
+    fn sysbus_read_pipeline_end_to_end_via_mock() {
+        // Five words: the batch queues five scans (one uncaptured priming
+        // read, three captured reads, one captured no-op tail); scan k
+        // carries data[k-1], so the raw captures yield words 0..3 and the
+        // final word arrives from the post-stop sbdata0 read.
+        let words: Vec<u32> = vec![0x100, 0x200, 0x300, 0x400, 0x500];
+        let raw_capture = |data: u32| -> Vec<u8> {
+            let value = (data as u128) << 2;
+            value.to_le_bytes()[..6].to_vec()
+        };
+        let mock = MockDtmAccess::default()
+            .with_deferred_raw_results(words[..4].iter().map(|w| raw_capture(*w)))
+            .with_read_responses([words[4]]);
+        let log = mock.log.clone();
+
+        let mut state = RiscvCommunicationInterfaceState::new();
+        let mut interface = make_interface(mock, &mut state);
+
+        let mut data = [0u32; 5];
+        interface
+            .perform_memory_read_multiple_sysbus(0x8000_0000, &mut data)
+            .unwrap();
+        assert_eq!(&data, &words[..]);
+
+        let log = log.lock().unwrap();
+        let sbcs_addr = Sbcs::get_mmio_address();
+        let sbdata_addr = Sbdata0::get_mmio_address();
+
+        // The engine is stopped (readondata and autoincrement cleared)
+        // BEFORE the final sbdata0 read - reading data with the engine
+        // still armed would trigger an access past the range.
+        let final_read = log
+            .events
+            .iter()
+            .rposition(|event| matches!(event, MockEvent::Read(addr) if *addr == sbdata_addr))
+            .expect("final sbdata0 read");
+        let stop_written_before = log.events[..final_read].iter().any(|event| {
+            matches!(
+                *event,
+                MockEvent::Write(addr, value)
+                    if addr == sbcs_addr
+                        && (value >> 15) & 1 == 0
+                        && (value >> 16) & 1 == 0
+                        && (value >> 17) & 0x7 == 2
+            )
+        });
+        assert!(
+            stop_written_before,
+            "engine must be stopped before the final word is read"
+        );
+
+        // Exactly the planned scans were queued: three captured reads and
+        // one uncaptured priming read on sbdata0, plus one no-op tail.
+        let sbdata_scheduled = log
+            .scheduled_reads
+            .iter()
+            .filter(|addr| **addr == sbdata_addr)
+            .count();
+        assert_eq!(sbdata_scheduled, 4);
+        let noop_scheduled = log
+            .scheduled_reads
+            .iter()
+            .filter(|addr| **addr == u64::MAX)
+            .count();
+        assert_eq!(noop_scheduled, 1);
+    }
+
+    #[test]
+    fn sysbus_read_pipeline_abandons_engine_on_scan_error() {
+        // A failed pipeline member must not leave the engine armed: the
+        // error path waits out sbbusy and writes the stop configuration,
+        // so a caller retry never writes sbcs against a busy engine
+        // (undefined behavior per the SBCS contract).
+        let raw_capture = |data: u32, op: u128| -> Vec<u8> {
+            let value = ((data as u128) << 2) | op;
+            value.to_le_bytes()[..6].to_vec()
+        };
+        let mock = MockDtmAccess::default().with_deferred_raw_results([
+            raw_capture(0x100, 0),
+            raw_capture(0x200, 2), // stalled op surfaces as an error
+            raw_capture(0, 0),     // tail no-op response
+        ]);
+        let log = mock.log.clone();
+
+        let mut state = RiscvCommunicationInterfaceState::new();
+        let mut interface = make_interface(mock, &mut state);
+
+        let mut data = [0u32; 3];
+        let result = interface.perform_memory_read_multiple_sysbus(0x8000_0000, &mut data);
+        assert!(matches!(result, Err(RiscvError::SystemBusAccess)));
+
+        let log = log.lock().unwrap();
+        let sbcs_addr = Sbcs::get_mmio_address();
+        let last_sbcs_write = log.events.iter().rev().find_map(|event| match event {
+            MockEvent::Write(addr, value) if *addr == sbcs_addr => Some(*value),
+            _ => None,
+        });
+        // The last sbcs write is the stop configuration the abandon path
+        // leaves behind: the access-triggering bits are off.
+        let stop = last_sbcs_write.expect("a stop write after the error");
+        assert_eq!((stop >> 15) & 1, 0, "readondata must be off: {stop:#x}");
+        assert_eq!((stop >> 16) & 1, 0, "autoincrement must be off: {stop:#x}");
+    }
+
+    #[test]
+    fn sysbus_read_pipeline_multi_batch_advances_address() {
+        // 65 words span two batches (64 + 1). Batch 1 fills words 0..62
+        // from raw captures, its tail word 63 from the post-stop read;
+        // batch 2 re-arms and reads word 64 the same way. This pins the
+        // driver's consumption of the batch plan: per-batch output
+        // slicing and the per-batch bus address.
+        let word = |i: u32| 0xA000_0000 + i;
+        let raw_capture = |data: u32| -> Vec<u8> {
+            let value = (data as u128) << 2;
+            value.to_le_bytes()[..6].to_vec()
+        };
+        let mock = MockDtmAccess::default()
+            .with_deferred_raw_results((0..63).map(|i| raw_capture(word(i))))
+            .with_read_responses([word(63), word(64)]);
+        let log = mock.log.clone();
+
+        let mut state = RiscvCommunicationInterfaceState::new();
+        let mut interface = make_interface(mock, &mut state);
+
+        let mut data = [0u32; 65];
+        interface
+            .perform_memory_read_multiple_sysbus(0x8000_0000, &mut data)
+            .unwrap();
+
+        // Every word lands in its own slot across the batch boundary.
+        let expected: Vec<u32> = (0..65).map(word).collect();
+        assert_eq!(&data[..], &expected[..]);
+
+        let log = log.lock().unwrap();
+        let sbaddress0_writes: Vec<u32> = log
+            .writes
+            .iter()
+            .filter(|(address, _)| *address == Sbaddress0::get_mmio_address())
+            .map(|&(_, value)| value)
+            .collect();
+        assert_eq!(sbaddress0_writes.len(), 2);
+        // The second batch starts one batch's words past the range start.
+        assert_eq!(sbaddress0_writes[0], 0x8000_0000);
+        assert_eq!(sbaddress0_writes[1], 0x8000_0000 + 64 * 4);
+
+        // The pipeline is re-armed for the second batch (readondata and
+        // autoincrement set again after the first batch's stop write).
+        let rearm_count = log
+            .writes
+            .iter()
+            .filter(|(address, value)| {
+                *address == Sbcs::get_mmio_address()
+                    && (value >> 15) & 1 == 1
+                    && (value >> 16) & 1 == 1
+            })
+            .count();
+        assert_eq!(rearm_count, 2);
+    }
+
+    #[test]
+    fn sysbus_read_pipeline_clears_sticky_error_on_failure() {
+        // A sticky sberror left in the engine surfaces as an error, and
+        // the failure path clears exactly the sticky bits (write-one-to-
+        // clear) after the final word read so later system-bus work
+        // starts clean.
+        let word = |i: u32| 0xB000_0000 + i;
+        let raw_capture = |data: u32| -> Vec<u8> {
+            let value = (data as u128) << 2;
+            value.to_le_bytes()[..6].to_vec()
+        };
+        let mut mock = MockDtmAccess::default()
+            .with_deferred_raw_results((0..4).map(|i| raw_capture(word(i))))
+            .with_read_responses([word(4)]);
+        // Seed a sticky sberror = 1; re-configuration writes do not clear
+        // it (write-one-to-clear), so the final status check sees it.
+        mock.registers.insert(Sbcs::get_mmio_address(), 1 << 12);
+        let log = mock.log.clone();
+
+        let mut state = RiscvCommunicationInterfaceState::new();
+        let mut interface = make_interface(mock, &mut state);
+
+        let mut data = [0u32; 5];
+        let result = interface.perform_memory_read_multiple_sysbus(0x8000_0000, &mut data);
+        assert!(matches!(result, Err(RiscvError::SystemBusAccess)));
+
+        let log = log.lock().unwrap();
+        // The clear write carries exactly the sticky bits that were set.
+        let clear_writes: Vec<(usize, u32)> = log
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(position, event)| match event {
+                MockEvent::Write(address, value)
+                    if *address == Sbcs::get_mmio_address() && *value == 1 << 12 =>
+                {
+                    Some((position, *value))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            clear_writes.len(),
+            1,
+            "exactly one clear write with only the sticky sberror bits"
+        );
+
+        // The clear happens after the final word was collected.
+        let last_sbdata_read = log
+            .events
+            .iter()
+            .rposition(|event| {
+                matches!(event, MockEvent::Read(addr) if *addr == Sbdata0::get_mmio_address())
+            })
+            .expect("final sbdata0 read");
+        assert!(clear_writes[0].0 > last_sbdata_read);
     }
 }

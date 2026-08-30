@@ -1,0 +1,1 @@
+Speed up RISC-V system-bus memory reads by pipelining up to 64 words per DMI queue flush instead of one word per USB round trip, and make a range read perform exactly one bus access per word so reads ending at a flash region boundary no longer leave a sticky system-bus error behind.
