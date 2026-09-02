@@ -94,4 +94,14 @@ pub trait DtmAccess: Send + fmt::Debug {
             function_name: "schedule_raw_read_uncaptured",
         }))
     }
+
+    /// Override the idle cycles injected between JTAG DR scans for the
+    /// duration of a diagnostic sequence. Returns the previous value so
+    /// callers restore it.
+    #[doc(hidden)]
+    fn set_debug_idle_cycles(&mut self, _idle: u8) -> Result<u8, RiscvError> {
+        Err(RiscvError::DebugProbe(DebugProbeError::NotImplemented {
+            function_name: "set_debug_idle_cycles",
+        }))
+    }
 }

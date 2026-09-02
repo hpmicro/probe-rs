@@ -95,7 +95,7 @@ pub struct RawDmiResponse {
 /// Role of a captured scan within a system-bus read sequence: which
 /// system-bus word its response carries, or why it carries none.
 #[doc(hidden)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanRole {
     /// Response holds `Sbdata0` for system-bus word #0 (the word at the
     /// sequence address), word #1, and so on.
@@ -111,6 +111,34 @@ pub enum ScanRole {
 pub struct ScanOutcome {
     pub response: RawDmiResponse,
     pub role: ScanRole,
+}
+
+/// Result of one system-bus read experiment run.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct SysbusExperimentResult {
+    /// All captured scans in queue order.
+    pub scans: Vec<ScanOutcome>,
+    /// Raw `sbcs` value read right after the batch executed, before any
+    /// cleanup (carries `sbbusy`/`sbbusyerror`/`sberror` as the batch
+    /// left them).
+    pub sbcs_after_batch: u32,
+}
+
+/// Scan structure for [`RiscvCommunicationInterface::debug_dmi_repeat_read`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub enum DebugDmiRepeatMode {
+    /// Uncaptured priming read followed by captured reads.
+    BackToBack,
+    /// Every scan captured (no uncaptured scans in the batch). Yields one
+    /// more response than requested: the first entry holds the result of
+    /// the DMI operation that preceded this batch, so callers compare
+    /// from the second entry on.
+    AllCaptured,
+    /// Uncaptured read + captured no-op pairs, the structure the
+    /// program-buffer path uses.
+    NoopPairs,
 }
 
 /// Decode a raw DMI scan capture into its op and data fields. The 41-bit
@@ -1155,6 +1183,248 @@ impl<'state> RiscvCommunicationInterface<'state> {
         stop.set_sbreadondata(false);
         stop.set_sbautoincrement(false);
         self.write_dm_register(stop)
+    }
+
+    /// Scan plan for the system-bus experiment: per word, a captured
+    /// carrier for its data and, with filler no-ops, the fillers and the
+    /// advancing read (captured; its response is ignored) around it. A
+    /// scan's capture holds the result of the *previous* scan's request,
+    /// so the carrier of word N's data must precede the read that
+    /// advances the pipeline past word N; without filler the reads carry
+    /// their predecessor's result directly.
+    fn plan_sysbus_experiment_scans(
+        word_count: usize,
+        noops_between: usize,
+    ) -> Vec<(bool, ScanRole)> {
+        let mut plan: Vec<(bool, ScanRole)> = Vec::with_capacity(word_count * 2 + 1);
+        if noops_between == 0 {
+            for word in 0..word_count {
+                plan.push((false, ScanRole::Data(word)));
+            }
+        } else {
+            for word in 0..word_count {
+                plan.push((true, ScanRole::Data(word)));
+                for _ in 1..noops_between {
+                    plan.push((true, ScanRole::Ignored));
+                }
+                plan.push((false, ScanRole::Ignored));
+            }
+        }
+        plan
+    }
+
+    /// System-bus batch-read experiment: read `word_count` consecutive
+    /// words starting at `address` with `sbreadondata` pipelining inside a
+    /// single DMI queue flush, and report every raw response plus the
+    /// `sbcs` status the batch left behind.
+    ///
+    /// Sequence shape (all in one `execute` unless the USB batching of the
+    /// probe splits it): a priming `Sbdata0` read (uncaptured), then per
+    /// word a captured carrier no-op or read with optional filler no-ops
+    /// (see [`Self::plan_sysbus_experiment_scans`]).
+    ///
+    /// `idle_cycles`, when set, overrides the probe's idle TCK count for
+    /// the entire run, including configuration and cleanup; the previous
+    /// value is restored on every exit path, including errors. The caller
+    /// must ensure the target is in a clean system-bus state (no sticky
+    /// errors) before calling. On success, this method cleans up sticky
+    /// errors and stops the engine before returning; an error return may
+    /// leave the system-bus engine armed.
+    #[doc(hidden)]
+    pub fn debug_sysbus_read_experiment(
+        &mut self,
+        address: u32,
+        word_count: usize,
+        idle_cycles: Option<u8>,
+        noops_between: usize,
+    ) -> Result<SysbusExperimentResult, RiscvError> {
+        let previous_idle = match idle_cycles {
+            Some(idle) => Some(self.dtm.set_debug_idle_cycles(idle)?),
+            None => None,
+        };
+
+        // Restore the idle override on every exit path - a leaked
+        // override would change the pacing of all later transfers.
+        let outcome = self.debug_sysbus_read_experiment_run(address, word_count, noops_between);
+        if let Some(idle) = previous_idle {
+            // A failing restore must not mask the original outcome; only
+            // a successful run can promote the restore error.
+            if let Err(restore_err) = self.dtm.set_debug_idle_cycles(idle) {
+                if outcome.is_ok() {
+                    return Err(restore_err);
+                }
+                tracing::warn!("failed to restore idle cycles: {restore_err}");
+            }
+        }
+        outcome
+    }
+
+    fn debug_sysbus_read_experiment_run(
+        &mut self,
+        address: u32,
+        word_count: usize,
+        noops_between: usize,
+    ) -> Result<SysbusExperimentResult, RiscvError> {
+        let sbdata0 = Sbdata::R0_ADDRESS as u64;
+
+        // Configure: word access, read triggered by address write and by
+        // every Sbdata0 read, address auto-increments.
+        let mut sbcs = Sbcs(0);
+        sbcs.set_sbaccess(RiscvBusAccess::A32 as u32);
+        sbcs.set_sbreadonaddr(true);
+        sbcs.set_sbreadondata(true);
+        sbcs.set_sbautoincrement(true);
+        self.write_dm_register(sbcs)?;
+
+        // The address write triggers access #1; the immediate-path USB
+        // round trip to the next command is the completion window it gets.
+        self.write_dm_register(Sbaddress0(address))?;
+
+        // Prime the pipeline: this read's response (the result of the
+        // address-write operation) is not captured.
+        self.dtm.schedule_raw_read_uncaptured(sbdata0)?;
+
+        let plan = Self::plan_sysbus_experiment_scans(word_count, noops_between);
+
+        let mut indices: Vec<DeferredResultIndex> = Vec::with_capacity(plan.len());
+        for (is_noop, _) in &plan {
+            let index = if *is_noop {
+                self.dtm.schedule_raw_noop()?
+            } else {
+                self.dtm.schedule_raw_read(sbdata0)?
+            };
+            indices.push(index);
+        }
+
+        self.dtm.execute()?;
+
+        let mut scans = Vec::with_capacity(plan.len());
+        for (index, (_, role)) in indices.into_iter().zip(plan.iter()) {
+            let response = decode_raw_response(self.dtm.read_deferred_result(index)?)?;
+            scans.push(ScanOutcome {
+                response,
+                role: *role,
+            });
+        }
+
+        // Sample the status before any cleanup: sbbusyerror here would
+        // mean a scan read Sbdata0 while an access was in progress.
+        let sbcs_after_batch = self.read_dm_register::<Sbcs>()?.0;
+
+        // Cleanup: stop the engine, then clear any sticky errors the
+        // experiment produced so later system-bus work starts clean.
+        // An engine that never leaves sbbusy is reported, not silently
+        // declared successful: this surface exists to investigate
+        // exactly that kind of wedge.
+        let mut status = self.read_dm_register::<Sbcs>()?;
+        let mut polls = 0;
+        while status.sbbusy() && polls < SBBUSY_POLL_LIMIT {
+            status = self.read_dm_register::<Sbcs>()?;
+            polls += 1;
+        }
+        if status.sbbusy() {
+            return Err(RiscvError::SystemBusAccess);
+        }
+        self.write_dm_register(Sbcs(0))?;
+        let final_status: Sbcs = self.read_dm_register()?;
+        if final_status.sberror() != 0 || final_status.sbbusyerror() {
+            let mut clear = Sbcs(0);
+            clear.set_sberror(final_status.sberror());
+            clear.set_sbbusyerror(final_status.sbbusyerror());
+            self.write_dm_register(clear)?;
+        }
+
+        Ok(SysbusExperimentResult {
+            scans,
+            sbcs_after_batch,
+        })
+    }
+
+    /// DMI pipeline isolation experiment: read the same (static) DMI
+    /// register `count` times inside a single queue flush and return every
+    /// raw response. `mode` selects the scan structure; as with the
+    /// system-bus experiment, an `idle_cycles` override is restored on
+    /// every exit path.
+    ///
+    /// The returned vector's length and first entry depend on the mode:
+    /// [`DebugDmiRepeatMode::BackToBack`] and
+    /// [`DebugDmiRepeatMode::NoopPairs`] return exactly `count` responses,
+    /// while [`DebugDmiRepeatMode::AllCaptured`] returns `count + 1` whose
+    /// first entry holds the result of whatever DMI operation preceded
+    /// this batch - compare from the second entry on.
+    #[doc(hidden)]
+    pub fn debug_dmi_repeat_read(
+        &mut self,
+        address: u64,
+        count: usize,
+        idle_cycles: Option<u8>,
+        mode: DebugDmiRepeatMode,
+    ) -> Result<Vec<RawDmiResponse>, RiscvError> {
+        let previous_idle = match idle_cycles {
+            Some(idle) => Some(self.dtm.set_debug_idle_cycles(idle)?),
+            None => None,
+        };
+
+        let outcome = self.debug_dmi_repeat_read_run(address, count, mode);
+        if let Some(idle) = previous_idle {
+            // A failing restore must not mask the original outcome; only
+            // a successful run can promote the restore error.
+            if let Err(restore_err) = self.dtm.set_debug_idle_cycles(idle) {
+                if outcome.is_ok() {
+                    return Err(restore_err);
+                }
+                tracing::warn!("failed to restore idle cycles: {restore_err}");
+            }
+        }
+        outcome
+    }
+
+    fn debug_dmi_repeat_read_run(
+        &mut self,
+        address: u64,
+        count: usize,
+        mode: DebugDmiRepeatMode,
+    ) -> Result<Vec<RawDmiResponse>, RiscvError> {
+        let mut indices = Vec::with_capacity(count + 1);
+        match mode {
+            DebugDmiRepeatMode::BackToBack => {
+                self.dtm.schedule_raw_read_uncaptured(address)?;
+                for _ in 0..count {
+                    indices.push(self.dtm.schedule_raw_read(address)?);
+                }
+            }
+            DebugDmiRepeatMode::AllCaptured => {
+                // The first captured response is the result of whatever
+                // DMI operation preceded this batch (not a read of
+                // `address`); callers compare from the second entry on.
+                for _ in 0..=count {
+                    indices.push(self.dtm.schedule_raw_read(address)?);
+                }
+            }
+            DebugDmiRepeatMode::NoopPairs => {
+                for _ in 0..count {
+                    self.dtm.schedule_raw_read_uncaptured(address)?;
+                    indices.push(self.dtm.schedule_raw_noop()?);
+                }
+            }
+        }
+        self.dtm.execute()?;
+
+        let mut responses = Vec::with_capacity(indices.len());
+        for index in indices {
+            responses.push(decode_raw_response(self.dtm.read_deferred_result(index)?)?);
+        }
+
+        Ok(responses)
+    }
+
+    /// Immediate (round-trip) write to a DM register by address, without
+    /// the typed register wrappers. For diagnostics that set up unusual
+    /// debug-module states (e.g. auto-execution) outside the normal
+    /// access flows.
+    #[doc(hidden)]
+    pub fn debug_dm_register_write(&mut self, address: u64, value: u32) -> Result<(), RiscvError> {
+        self.write_dm_register_untyped(address, value)
     }
 
     /// Perform memory reads using the abstract access-memory command
@@ -2681,6 +2951,12 @@ pub(crate) mod test_mocks {
         pub executes: usize,
         /// Full transport timeline, in order.
         pub events: Vec<MockEvent>,
+        /// Raw DMI scans queued through the raw primitives, as
+        /// (address, captured) pairs in order.
+        pub raw_scan_log: Vec<(u64, bool)>,
+        /// Idle-cycle overrides applied through set_debug_idle_cycles, in
+        /// order; the last entry is the current value.
+        pub idle_cycles_history: Vec<u8>,
     }
 
     #[derive(Debug, Default)]
@@ -2703,6 +2979,9 @@ pub(crate) mod test_mocks {
         pub abstractcs_after_data_reads: Option<u32>,
         /// Writes that are queued but not yet executed.
         pending_writes: Vec<(u64, u32)>,
+        /// Current idle-cycle override, set through
+        /// [`DtmAccess::set_debug_idle_cycles`].
+        pub idle_cycles: u8,
     }
 
     impl MockDtmAccess {
@@ -2880,6 +3159,7 @@ pub(crate) mod test_mocks {
             let mut log = self.log.lock().unwrap();
             log.scheduled_reads.push(address);
             log.events.push(MockEvent::ScheduledRead(address));
+            log.raw_scan_log.push((address, true));
             Ok(DeferredResultIndex::new_for_testing())
         }
 
@@ -2887,6 +3167,7 @@ pub(crate) mod test_mocks {
             let mut log = self.log.lock().unwrap();
             log.scheduled_reads.push(u64::MAX);
             log.events.push(MockEvent::ScheduledRead(u64::MAX));
+            log.raw_scan_log.push((u64::MAX, true));
             Ok(DeferredResultIndex::new_for_testing())
         }
 
@@ -2894,7 +3175,15 @@ pub(crate) mod test_mocks {
             let mut log = self.log.lock().unwrap();
             log.scheduled_reads.push(address);
             log.events.push(MockEvent::ScheduledRead(address));
+            log.raw_scan_log.push((address, false));
             Ok(())
+        }
+
+        fn set_debug_idle_cycles(&mut self, idle: u8) -> Result<u8, RiscvError> {
+            let previous = self.idle_cycles;
+            self.idle_cycles = idle;
+            self.log.lock().unwrap().idle_cycles_history.push(idle);
+            Ok(previous)
         }
     }
 }
@@ -3564,5 +3853,136 @@ mod tests {
             })
             .expect("final sbdata0 read");
         assert!(clear_writes[0].0 > last_sbdata_read);
+    }
+
+    #[test]
+    fn plan_sysbus_experiment_orders_scan_roles() {
+        use ScanRole::*;
+
+        // Without filler, the reads carry their predecessor's result
+        // directly: every scan is a read and a data carrier.
+        assert_eq!(
+            RiscvCommunicationInterface::plan_sysbus_experiment_scans(3, 0),
+            vec![(false, Data(0)), (false, Data(1)), (false, Data(2))]
+        );
+
+        // With one filler no-op per word: the no-op carries the word's
+        // data, the captured read advances the pipeline.
+        assert_eq!(
+            RiscvCommunicationInterface::plan_sysbus_experiment_scans(2, 1),
+            vec![
+                (true, Data(0)),
+                (false, Ignored),
+                (true, Data(1)),
+                (false, Ignored)
+            ]
+        );
+
+        // Additional fillers sit between the carrier and the advancing
+        // read, ignored.
+        assert_eq!(
+            RiscvCommunicationInterface::plan_sysbus_experiment_scans(1, 2),
+            vec![(true, Data(0)), (true, Ignored), (false, Ignored)]
+        );
+    }
+
+    #[test]
+    fn debug_dmi_repeat_read_mode_shapes() {
+        let address = 0x38u64;
+        let zero_capture = || vec![0u8; 6];
+
+        for (mode, expected) in [
+            (
+                DebugDmiRepeatMode::BackToBack,
+                vec![(address, false), (address, true), (address, true)],
+            ),
+            (
+                DebugDmiRepeatMode::AllCaptured,
+                vec![(address, true), (address, true), (address, true)],
+            ),
+            (
+                DebugDmiRepeatMode::NoopPairs,
+                vec![
+                    (address, false),
+                    (u64::MAX, true),
+                    (address, false),
+                    (u64::MAX, true),
+                ],
+            ),
+        ] {
+            let mut state = RiscvCommunicationInterfaceState::new();
+            let mock = MockDtmAccess::default().with_deferred_raw_results([
+                zero_capture(),
+                zero_capture(),
+                zero_capture(),
+            ]);
+            let log = mock.log.clone();
+            let mut interface = make_interface(mock, &mut state);
+
+            interface
+                .debug_dmi_repeat_read(address, 2, None, mode)
+                .unwrap();
+
+            assert_eq!(log.lock().unwrap().raw_scan_log, expected, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn sysbus_experiment_reports_wedged_engine() {
+        // An engine that never leaves sbbusy is an error, not a silent
+        // success: the cleanup poll exhausts and the call reports the
+        // wedge, matching the production read's loud handling.
+        let mut state = RiscvCommunicationInterfaceState::new();
+        let mut mock = MockDtmAccess::default();
+        mock.registers
+            .insert(Sbcs::get_mmio_address(), 1 << 21 /* sbbusy */);
+        mock.deferred_raw_results.push_back(vec![0u8; 6]);
+        let mut interface = make_interface(mock, &mut state);
+
+        let result = interface.debug_sysbus_read_experiment(0x2000, 1, None, 0);
+        assert!(matches!(result, Err(RiscvError::SystemBusAccess)));
+    }
+
+    #[test]
+    fn set_debug_idle_cycles_round_trips_previous_value() {
+        // The override is restored on EVERY exit path. The first run
+        // succeeds (one scripted capture for its no-op); the second runs
+        // out of captures mid-batch and must still restore.
+        let mut state = RiscvCommunicationInterfaceState::new();
+        let mut mock = MockDtmAccess::default();
+        mock.idle_cycles = 7;
+        mock.deferred_raw_results.push_back(vec![0u8; 6]);
+        let log = mock.log.clone();
+        let mut interface = make_interface(mock, &mut state);
+
+        interface
+            .debug_dmi_repeat_read(0x38, 1, Some(9), DebugDmiRepeatMode::NoopPairs)
+            .unwrap();
+
+        let failed =
+            interface.debug_dmi_repeat_read(0x38, 2, Some(9), DebugDmiRepeatMode::BackToBack);
+        assert!(failed.is_err());
+
+        // Override to 9 and restore to 7 on both exit paths.
+        assert_eq!(log.lock().unwrap().idle_cycles_history, vec![9, 7, 9, 7]);
+    }
+
+    #[test]
+    fn debug_dm_register_write_forwards_address_and_value() {
+        let mut state = RiscvCommunicationInterfaceState::new();
+        let mock = MockDtmAccess::default();
+        let log = mock.log.clone();
+        let mut interface = make_interface(mock, &mut state);
+
+        interface
+            .debug_dm_register_write(0x38, 0xDEAD_BEEF)
+            .unwrap();
+
+        let log = log.lock().unwrap();
+        assert!(
+            log.writes.contains(&(0x38, 0xDEAD_BEEF)),
+            "write must forward the address and value in order, got {:?}",
+            log.writes
+        );
     }
 }

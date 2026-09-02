@@ -304,6 +304,12 @@ impl DtmAccess for JtagDtm<'_> {
         Ok(())
     }
 
+    fn set_debug_idle_cycles(&mut self, idle: u8) -> Result<u8, RiscvError> {
+        let previous = self.probe.idle_cycles();
+        self.probe.set_idle_cycles(idle);
+        Ok(previous)
+    }
+
     fn schedule_read(&mut self, address: u64) -> Result<DeferredResultIndex, RiscvError> {
         // Prepare the read by sending a read request with the register address
         self.schedule_dmi_register_access(DmiOperation::Read { address })?;
