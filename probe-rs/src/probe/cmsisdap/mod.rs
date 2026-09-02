@@ -733,6 +733,7 @@ impl CmsisDap {
             match protocol {
                 WireProtocol::Swd => ConnectRequest::Swd,
                 WireProtocol::Jtag => ConnectRequest::Jtag,
+                WireProtocol::CJtag => ConnectRequest::CJtag,
             }
         } else {
             ConnectRequest::DefaultPort
@@ -743,6 +744,7 @@ impl CmsisDap {
             .and_then(|v| match v {
                 ConnectResponse::SuccessfulInitForSWD => Ok(WireProtocol::Swd),
                 ConnectResponse::SuccessfulInitForJTAG => Ok(WireProtocol::Jtag),
+                ConnectResponse::SuccessfulInitForCJTAG => Ok(WireProtocol::CJtag),
                 ConnectResponse::InitFailed => Err(CmsisDapError::ErrorResponse),
             })?;
 

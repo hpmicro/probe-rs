@@ -867,6 +867,15 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
             Some(WireProtocol::Swd) => {
                 tracing::debug!("SWD: Connecting to debug port with address {:x?}", dp);
             }
+            Some(WireProtocol::CJtag) => {
+                // cJTAG serves RISC-V targets; no driver offers an ARM
+                // debug interface over it. Fail loudly rather than running
+                // SWD line-reset patterns against an OScan1-active probe.
+                return Err(ArmDebugSequenceError::SequenceSpecific(
+                    "ARM debug sequences are not available over cJTAG".into(),
+                )
+                .into());
+            }
             None => {
                 return Err(ArmDebugSequenceError::SequenceSpecific(
                     "Cannot detect current protocol".into(),

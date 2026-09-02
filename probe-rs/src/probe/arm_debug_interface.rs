@@ -579,6 +579,9 @@ fn perform_raw_transfers<P: DebugProbe + RawProtocolIo + JTAGAccess>(
     match probe.active_protocol().unwrap() {
         WireProtocol::Swd => perform_swd_transfers(probe, transfers),
         WireProtocol::Jtag => perform_jtag_transfers(probe, transfers),
+        // cJTAG serves RISC-V targets on this driver; ARM JTAG-DP over
+        // it is rejected here.
+        WireProtocol::CJtag => Err(DebugProbeError::UnsupportedProtocol(WireProtocol::CJtag)),
     }
 }
 
@@ -1142,6 +1145,10 @@ fn send_sequence<P: RawProtocolIo + JTAGAccess>(
         }
         WireProtocol::Swd => {
             probe.swd_io(sequence.direction_bits(), sequence.io_bits())?;
+        }
+        // See perform_raw_transfers: ARM sequences over cJTAG are rejected.
+        WireProtocol::CJtag => {
+            return Err(DebugProbeError::UnsupportedProtocol(WireProtocol::CJtag))
         }
     }
 
