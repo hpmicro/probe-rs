@@ -1,0 +1,1 @@
+Add cJTAG (IEEE 1149.7, 2-pin OScan1) as a selectable wire protocol on CMSIS-DAP probes whose firmware reports the capability: pass --protocol cjtag to connect to RISC-V targets over two pins, with the probe firmware performing the OScan1 activation during connect. The info command probes cJTAG as part of the JTAG family.

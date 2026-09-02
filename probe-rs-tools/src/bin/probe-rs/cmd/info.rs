@@ -61,7 +61,7 @@ impl Cmd {
         let protocols = if let Some(protocol) = probe_options.protocol() {
             vec![protocol]
         } else {
-            vec![WireProtocol::Jtag, WireProtocol::Swd]
+            vec![WireProtocol::Jtag, WireProtocol::Swd, WireProtocol::CJtag]
         };
 
         for protocol in protocols {
@@ -80,6 +80,20 @@ impl Cmd {
             probe.detach()?;
 
             if let Err(e) = result {
+                // A probe whose firmware cannot speak a protocol reports
+                // it as unsupported - the expected answer for most
+                // probes, not worth an error line per protocol.
+                if e.root_cause()
+                    .downcast_ref::<probe_rs::probe::DebugProbeError>()
+                    .is_some_and(|err| {
+                        matches!(
+                            err,
+                            probe_rs::probe::DebugProbeError::UnsupportedProtocol(_)
+                        )
+                    })
+                {
+                    continue;
+                }
                 println!("Error identifying target using protocol {protocol}: {e}");
             }
 
@@ -157,12 +171,12 @@ fn try_show_info(
             }
         }
     } else {
-        println!("No DAP interface was found on the connected probe. ARM-specific information cannot be printed.");
+        println!("No ARM debug interface is available: the probe either exposes no DAP interface, or the active protocol gates the ARM interface off (cJTAG serves RISC-V targets). ARM-specific information cannot be printed.");
     }
 
     // This check is a bit weird, but `try_into_riscv_interface` will try to switch the protocol to JTAG.
     // If the current protocol we want to use is SWD, we have avoid this.
-    if probe.has_riscv_interface() && protocol == WireProtocol::Jtag {
+    if probe.has_riscv_interface() && protocol.is_jtag_family() {
         tracing::debug!("Trying to show RISC-V chip information");
         match probe.try_get_riscv_interface_builder() {
             Ok(factory) => {
@@ -183,7 +197,7 @@ fn try_show_info(
         }
     } else if protocol == WireProtocol::Swd {
         println!(
-            "Debugging RISC-V targets over SWD is not supported. For these targets, JTAG is the only supported protocol. RISC-V specific information cannot be printed."
+            "Debugging RISC-V targets over SWD is not supported. For these targets, use a JTAG-family transport (jtag, or cjtag on probes that support it). RISC-V specific information cannot be printed."
         );
     } else {
         println!(
@@ -193,7 +207,7 @@ fn try_show_info(
 
     // This check is a bit weird, but `try_into_xtensa_interface` will try to switch the protocol to JTAG.
     // If the current protocol we want to use is SWD, we have avoid this.
-    if probe.has_xtensa_interface() && protocol == WireProtocol::Jtag {
+    if probe.has_xtensa_interface() && protocol.is_jtag_family() {
         tracing::debug!("Trying to show Xtensa chip information");
         let mut state = XtensaDebugInterfaceState::default();
         match probe.try_get_xtensa_interface(&mut state) {
@@ -208,7 +222,7 @@ fn try_show_info(
         }
     } else if protocol == WireProtocol::Swd {
         println!(
-            "Debugging Xtensa targets over SWD is not supported. For these targets, JTAG is the only supported protocol. Xtensa specific information cannot be printed."
+            "Debugging Xtensa targets over SWD is not supported. For these targets, use a JTAG-family transport (jtag, or cjtag on probes that support it). Xtensa specific information cannot be printed."
         );
     } else {
         println!(
