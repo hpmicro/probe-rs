@@ -264,6 +264,12 @@ const ACCESS_MEMORY_READ: u32 = 2 << 24 | 2 << 20 | 1 << 19;
 /// The same access-memory command with the write bit (bit 16) set.
 const ACCESS_MEMORY_WRITE: u32 = ACCESS_MEMORY_READ | 1 << 16;
 
+/// Words per program-buffer read batch. Bounding the batch keeps the
+/// deferred queue depth compatible with the slowest load the program
+/// buffer reads from: a flash load takes many more cycles than a RAM
+/// load, and one giant queue overruns the debug module.
+const WORDS_PER_BATCH: usize = 32;
+
 impl RiscvCommunicationInterfaceState {
     /// Create a new interface state.
     pub fn new() -> Self {
@@ -1045,6 +1051,7 @@ impl<'state> RiscvCommunicationInterface<'state> {
         &mut self,
         address: u32,
         data: &mut [V],
+        timeout: Duration,
     ) -> Result<(), RiscvError> {
         // Backup registers s0 and s1
         let s0 = self.save_s0()?;
@@ -1075,46 +1082,65 @@ impl<'state> RiscvCommunicationInterface<'state> {
 
         self.schedule_write_dm_register(command)?;
 
-        let data_len = data.len();
+        // The program-buffer commands must run in bounded batches: one
+        // giant deferred queue overruns the debug module when a load is
+        // slow (the program buffer loads from flash, for example, take
+        // many more cycles than a RAM load), and later commands pile
+        // onto a busy module until the DMI reports invalid operations.
+        // Executing each batch and waiting for it to settle first keeps
+        // the queue depth compatible with the slowest load.
+        let total_words = data.len();
+        let mut word_index = 0;
+        for batch in data.chunks_mut(WORDS_PER_BATCH) {
+            let mut result_idxs = Vec::with_capacity(batch.len());
+            for _ in 0..batch.len() {
+                let mut command = AccessRegisterCommand(0);
+                command.set_cmd_type(0);
+                command.set_transfer(true);
+                command.set_write(false);
 
-        let mut result_idxs = Vec::with_capacity(data_len - 1);
-        for out_idx in 0..data_len - 1 {
-            let mut command = AccessRegisterCommand(0);
-            command.set_cmd_type(0);
-            command.set_transfer(true);
-            command.set_write(false);
+                // registers are 32 bit, so we have size 2 here
+                command.set_aarsize(RiscvBusAccess::A32);
+                // The read of the LAST word of the range must not execute
+                // the program buffer afterwards: the trailing load would
+                // read one word past the requested range, which faults and
+                // latches cmderr when the range ends at a memory-region
+                // boundary.
+                command.set_postexec(word_index + 1 < total_words);
 
-            // registers are 32 bit, so we have size 2 here
-            command.set_aarsize(RiscvBusAccess::A32);
-            command.set_postexec(true);
+                command.set_regno((registers::S1).id.0 as u32);
 
-            command.set_regno((registers::S1).id.0 as u32);
+                self.schedule_write_dm_register(command)?;
 
-            self.schedule_write_dm_register(command)?;
+                // Read back s1
+                result_idxs.push(self.schedule_read_dm_register::<Data0>()?);
+                word_index += 1;
+            }
 
-            // Read back s1
-            let value_idx = self.schedule_read_dm_register::<Data0>()?;
+            self.execute()?;
 
-            result_idxs.push((out_idx, value_idx));
-        }
+            for (slot, idx) in batch.iter_mut().zip(result_idxs) {
+                let value = Data0::from(self.dtm.read_deferred_result(idx)?.into_u32());
+                *slot = V::from_register_value(value.0);
+            }
 
-        // Specifically read the last value first. The result is that this last read is still
-        // part of the command queue we just assembled.
-        let last_value = self.abstract_cmd_register_read(&registers::S1)?;
-        data[data.len() - 1] = V::from_register_value(last_value);
-
-        for (out_idx, value_idx) in result_idxs {
-            let value = Data0::from(self.dtm.read_deferred_result(value_idx)?.into_u32());
-
-            data[out_idx] = V::from_register_value(value.0);
-        }
-
-        let status: Abstractcs = self.read_dm_register()?;
-
-        if status.cmderr() != 0 {
-            return Err(RiscvError::AbstractCommand(
-                AbstractCommandErrorKind::parse(status.cmderr() as u8),
-            ));
+            // Wait for the last command of the batch to finish before
+            // queueing the next one.
+            let start_time = Instant::now();
+            loop {
+                let status: Abstractcs = self.read_dm_register()?;
+                if !status.busy() {
+                    if status.cmderr() != 0 {
+                        return Err(RiscvError::AbstractCommand(
+                            AbstractCommandErrorKind::parse(status.cmderr() as u8),
+                        ));
+                    }
+                    break;
+                }
+                if start_time.elapsed() > timeout {
+                    return Err(RiscvError::Timeout);
+                }
+            }
         }
 
         self.restore_s0(s0)?;
@@ -1524,7 +1550,7 @@ impl<'state> RiscvCommunicationInterface<'state> {
 
         match self.state.memory_access_method(RiscvBusAccess::A32) {
             MemoryAccessMethod::ProgramBuffer => {
-                self.perform_memory_read_multiple_progbuf(address, data)?;
+                self.perform_memory_read_multiple_progbuf(address, data, RISCV_TIMEOUT)?;
             }
             MemoryAccessMethod::SystemBus => {
                 self.perform_memory_read_multiple_sysbus(address, data)?;
@@ -2371,6 +2397,15 @@ pub(crate) mod test_mocks {
     use crate::probe::{CommandResult, DebugProbeError, DeferredResultIndex};
     use crate::MemoryMappedRegister;
 
+    /// One transport-level observation, in order of occurrence.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub(crate) enum MockEvent {
+        Write(u64, u32),
+        Read(u64),
+        ScheduledRead(u64),
+        Execute,
+    }
+
     /// Observable activity of a [MockDtmAccess]; shareable so tests can
     /// inspect it after the interface has consumed the mock.
     #[derive(Debug, Default)]
@@ -2381,6 +2416,8 @@ pub(crate) mod test_mocks {
         pub scheduled_reads: Vec<u64>,
         /// Number of execute() flushes.
         pub executes: usize,
+        /// Full transport timeline, in order.
+        pub events: Vec<MockEvent>,
     }
 
     #[derive(Debug, Default)]
@@ -2393,6 +2430,10 @@ pub(crate) mod test_mocks {
         pub read_responses: VecDeque<u32>,
         /// Values served by read_deferred_result, in order.
         pub deferred_results: VecDeque<u32>,
+        /// Value reported by abstractcs reads once data reads have been
+        /// scheduled; models a busy or failed command state that appears
+        /// with the first batch's completion.
+        pub abstractcs_after_data_reads: Option<u32>,
         /// Writes that are queued but not yet executed.
         pending_writes: Vec<(u64, u32)>,
     }
@@ -2405,8 +2446,48 @@ pub(crate) mod test_mocks {
             }
         }
 
+        /// Script the abstractcs value reported once data reads have been
+        /// scheduled (models a busy or failed command state appearing with
+        /// the first batch's completion).
+        pub fn with_abstractcs_after_data_reads(mut self, value: u32) -> Self {
+            self.abstractcs_after_data_reads = Some(value);
+            self
+        }
+
+        /// Provide the values served by read_deferred_result, in order.
+        pub fn with_deferred_results(mut self, results: impl IntoIterator<Item = u32>) -> Self {
+            self.deferred_results = results.into_iter().collect();
+            self
+        }
+
         fn record_write(&mut self, address: u64, value: u32) {
-            self.log.lock().unwrap().writes.push((address, value));
+            let mut log = self.log.lock().unwrap();
+            log.writes.push((address, value));
+            log.events.push(MockEvent::Write(address, value));
+        }
+
+        /// Apply a register write with hardware-accurate semantics where
+        /// they matter: abstractcs.cmderr is write-one-to-clear, so the
+        /// error-clear writes the command machinery issues do not pollute
+        /// the readable state.
+        fn commit_register_write(&mut self, address: u64, value: u32) {
+            if address == super::Abstractcs::get_mmio_address() {
+                let entry = self.registers.entry(address).or_insert(0);
+                let remaining_cmderr = (*entry >> 8) & !((value >> 8) & 0x7);
+                *entry = (*entry & !(0x7 << 8)) | (remaining_cmderr << 8);
+            } else {
+                self.registers.insert(address, value);
+            }
+        }
+
+        fn data0_reads_scheduled(&self) -> bool {
+            let data0 = super::Data0::get_mmio_address();
+            self.log
+                .lock()
+                .unwrap()
+                .scheduled_reads
+                .iter()
+                .any(|address| *address == data0)
         }
     }
 
@@ -2434,10 +2515,14 @@ pub(crate) mod test_mocks {
         }
 
         fn execute(&mut self) -> Result<(), RiscvError> {
-            self.log.lock().unwrap().executes += 1;
+            {
+                let mut log = self.log.lock().unwrap();
+                log.executes += 1;
+                log.events.push(MockEvent::Execute);
+            }
             let pending = std::mem::take(&mut self.pending_writes);
             for (address, value) in pending {
-                self.registers.insert(address, value);
+                self.commit_register_write(address, value);
             }
             Ok(())
         }
@@ -2453,7 +2538,9 @@ pub(crate) mod test_mocks {
         }
 
         fn schedule_read(&mut self, address: u64) -> Result<DeferredResultIndex, RiscvError> {
-            self.log.lock().unwrap().scheduled_reads.push(address);
+            let mut log = self.log.lock().unwrap();
+            log.scheduled_reads.push(address);
+            log.events.push(MockEvent::ScheduledRead(address));
             Ok(DeferredResultIndex::new_for_testing())
         }
 
@@ -2462,6 +2549,18 @@ pub(crate) mod test_mocks {
             address: u64,
             _timeout: Duration,
         ) -> Result<u32, RiscvError> {
+            {
+                let mut log = self.log.lock().unwrap();
+                log.events.push(MockEvent::Read(address));
+            }
+            // A command state scripted to appear with the first batch's
+            // completion overrides the plain register map.
+            if address == super::Abstractcs::get_mmio_address()
+                && self.abstractcs_after_data_reads.is_some()
+                && self.data0_reads_scheduled()
+            {
+                return Ok(self.abstractcs_after_data_reads.unwrap());
+            }
             // Scripted responses model memory data arriving in data0; the
             // command machinery's own register reads (dmcontrol,
             // abstractcs) see the plain register map so commands complete
@@ -2481,19 +2580,40 @@ pub(crate) mod test_mocks {
             _timeout: Duration,
         ) -> Result<Option<u32>, RiscvError> {
             self.record_write(address, value);
-            self.registers.insert(address, value);
+            self.commit_register_write(address, value);
             Ok(Some(0))
         }
 
         fn read_idcode(&mut self) -> Result<Option<u32>, DebugProbeError> {
             Ok(None)
         }
+
+        fn schedule_raw_read(&mut self, address: u64) -> Result<DeferredResultIndex, RiscvError> {
+            let mut log = self.log.lock().unwrap();
+            log.scheduled_reads.push(address);
+            log.events.push(MockEvent::ScheduledRead(address));
+            Ok(DeferredResultIndex::new_for_testing())
+        }
+
+        fn schedule_raw_noop(&mut self) -> Result<DeferredResultIndex, RiscvError> {
+            let mut log = self.log.lock().unwrap();
+            log.scheduled_reads.push(u64::MAX);
+            log.events.push(MockEvent::ScheduledRead(u64::MAX));
+            Ok(DeferredResultIndex::new_for_testing())
+        }
+
+        fn schedule_raw_read_uncaptured(&mut self, address: u64) -> Result<(), RiscvError> {
+            let mut log = self.log.lock().unwrap();
+            log.scheduled_reads.push(address);
+            log.events.push(MockEvent::ScheduledRead(address));
+            Ok(())
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_mocks::MockDtmAccess;
+    use super::test_mocks::{MockDtmAccess, MockEvent, MockLog};
     use super::*;
 
     fn make_interface(
@@ -2698,5 +2818,155 @@ mod tests {
                 RiscvBusAccess::A16
             )))
         ));
+    }
+
+    /// Segment the transport timeline at execute() flushes and count the
+    /// data0 reads queued inside each segment: those are the batch
+    /// sizes of the program-buffer read path.
+    fn progbuf_batch_sizes(log: &MockLog) -> Vec<usize> {
+        let data0 = Data0::get_mmio_address();
+        let mut sizes = Vec::new();
+        let mut current = 0;
+        for event in &log.events {
+            match event {
+                MockEvent::ScheduledRead(address) if *address == data0 => current += 1,
+                MockEvent::Execute => {
+                    if current > 0 {
+                        sizes.push(current);
+                    }
+                    current = 0;
+                }
+                _ => {}
+            }
+        }
+        sizes
+    }
+
+    fn progbuf_mock(
+        word_count: usize,
+    ) -> (MockDtmAccess, std::sync::Arc<std::sync::Mutex<MockLog>>) {
+        let mock = MockDtmAccess::default().with_deferred_results(0..word_count as u32);
+        let log = mock.log.clone();
+        (mock, log)
+    }
+
+    #[test]
+    fn progbuf_bulk_read_splits_into_batches_of_32() {
+        assert_eq!(WORDS_PER_BATCH, 32);
+
+        for (words, expected) in [
+            (100usize, vec![32usize, 32, 32, 4]),
+            (32, vec![32]),
+            (1, vec![1]),
+        ] {
+            let mut state = RiscvCommunicationInterfaceState::new();
+            state.progbuf_size = 16;
+            let (mock, log) = progbuf_mock(words);
+            let mut interface = make_interface(mock, &mut state);
+
+            let mut data = vec![0u32; words];
+            interface
+                .perform_memory_read_multiple_progbuf(0x2000, &mut data, RISCV_TIMEOUT)
+                .unwrap();
+
+            // Every deferred result lands in its own slot, in order.
+            let expected_values: Vec<u32> = (0..words as u32).collect();
+            assert_eq!(&data, &expected_values, "{words} words");
+            let log = log.lock().unwrap();
+            assert_eq!(progbuf_batch_sizes(&log), expected, "{words} words");
+            // Exactly one flush per batch, no stray trailing flush.
+            assert_eq!(log.executes, expected.len(), "{words} words");
+        }
+    }
+
+    #[test]
+    fn progbuf_batch_checks_cmderr_before_next_batch() {
+        let mut state = RiscvCommunicationInterfaceState::new();
+        state.progbuf_size = 16;
+        let (mock, log) = progbuf_mock(100);
+        let mut interface =
+            make_interface(mock.with_abstractcs_after_data_reads(1 << 8), &mut state);
+
+        let mut data = vec![0u32; 100];
+        let result =
+            interface.perform_memory_read_multiple_progbuf(0x2000, &mut data, RISCV_TIMEOUT);
+
+        assert!(matches!(
+            result,
+            Err(RiscvError::AbstractCommand(AbstractCommandErrorKind::Busy))
+        ));
+        // The error surfaced after the FIRST batch: no later batch was
+        // ever queued.
+        assert_eq!(progbuf_batch_sizes(&log.lock().unwrap()), vec![32]);
+    }
+
+    #[test]
+    fn progbuf_batch_times_out_when_abstractcs_stays_busy() {
+        let mut state = RiscvCommunicationInterfaceState::new();
+        state.progbuf_size = 16;
+        let (mock, log) = progbuf_mock(70);
+        let mut interface =
+            make_interface(mock.with_abstractcs_after_data_reads(1 << 12), &mut state);
+
+        let mut data = vec![0u32; 70];
+        let start = Instant::now();
+        let result = interface.perform_memory_read_multiple_progbuf(
+            0x2000,
+            &mut data,
+            Duration::from_millis(100),
+        );
+
+        assert!(matches!(result, Err(RiscvError::Timeout)));
+        // The injected bound governs, not the default five seconds.
+        assert!(start.elapsed() < Duration::from_secs(2));
+        // The poll hung on the FIRST batch's completion.
+        assert_eq!(progbuf_batch_sizes(&log.lock().unwrap()), vec![32]);
+    }
+
+    #[test]
+    fn progbuf_bulk_read_last_word_executes_no_trailing_load() {
+        // Every read command except the last one re-arms the program
+        // buffer, whose execution loads the NEXT word. The last word's
+        // command must leave postexec off: the trailing load would read
+        // one word past the requested range and fault (latching cmderr)
+        // when the range ends at a memory-region boundary.
+        let mut state = RiscvCommunicationInterfaceState::new();
+        state.progbuf_size = 16;
+        let (mock, log) = progbuf_mock(3);
+        let mut interface = make_interface(mock, &mut state);
+
+        let mut data = vec![0u32; 3];
+        interface
+            .perform_memory_read_multiple_progbuf(0x2000, &mut data, RISCV_TIMEOUT)
+            .unwrap();
+        assert_eq!(&data, &[0, 1, 2]);
+
+        let cmd_addr = AccessRegisterCommand::get_mmio_address();
+        let postexec_bit = 1 << 18;
+        let commands: Vec<u32> = log
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                MockEvent::Write(address, value) if *address == cmd_addr => Some(*value),
+                _ => None,
+            })
+            .collect();
+        // Command-register layout: save s0, save s1, the setup write to
+        // s0, one read per word, then the register restores.
+        assert_eq!(commands.len(), 8);
+        let word_reads = &commands[3..6];
+        for command in &word_reads[..2] {
+            assert!(
+                command & postexec_bit != 0,
+                "postexec missing on a non-final word: {command:#x}"
+            );
+        }
+        assert!(
+            word_reads[2] & postexec_bit == 0,
+            "postexec set on the final word's command: {:#x}",
+            word_reads[2]
+        );
     }
 }
