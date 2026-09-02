@@ -23,7 +23,7 @@ use crate::{
             general::info::{CapabilitiesCommand, PacketCountCommand, SWOTraceBufferSizeCommand},
             CmsisDapError,
         },
-        common::{run_on_wire_tap_reset, JtagDriverState, JtagState, RawJtagIo},
+        common::{run_on_wire_tap_reset, IdCode, JtagDriverState, JtagState, RawJtagIo},
         BatchCommand, DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector, JTAGAccess,
         JtagChainItem, ProbeFactory, WireProtocol,
     },
@@ -788,7 +788,7 @@ impl DebugProbe for CmsisDap {
     /// Returns the JTAG scan chain
     fn scan_chain(&self) -> Result<&[ScanChainElement], DebugProbeError> {
         match self.active_protocol() {
-            Some(WireProtocol::Jtag) => {
+            Some(WireProtocol::Jtag) | Some(WireProtocol::CJtag) => {
                 if let Some(ref chain) = self.scan_chain {
                     Ok(chain.as_slice())
                 } else {
@@ -818,19 +818,78 @@ impl DebugProbe for CmsisDap {
             match_retry: 0,
         })?;
 
-        if self.active_protocol() == Some(WireProtocol::Jtag) {
-            // no-op: we configure JTAG in debug_port_setup,
-            // because that is where we execute the SWJ-DP Switch Sequence
-            // to ensure the debug port is ready for JTAG signals,
-            // at which point we can interrogate the scan chain
-            // and configure the probe with the given IR lengths.
-            {
-                // For arm MCU there is no need to do anything, but for riscv it is necessary. Or one day in architecture\riscv code to do the relevant processing, here you can delete.
+        match self.active_protocol() {
+            Some(WireProtocol::Jtag) => {
+                // For arm MCU there is no need to do anything, but for riscv it is necessary.
+                // Measure the chain (IDCODE scan + IR length measurement) and
+                // configure the probe with the measured IR lengths.
+                // A preceding cJTAG session can leave the TAP in compact
+                // mode, which the probe firmware never exits on its own; an
+                // all-ones SWJ sequence drives TMS through Test-Logic-Reset
+                // so the 4-pin scan starts from a known TAP state.
+                self.swj_sequence(SWJ_TAP_RECOVERY_BITS, SWJ_TAP_RECOVERY_PATTERN)?;
                 self.scan_chain()?;
                 self.select_target(0)?;
             }
-        } else {
-            self.configure_swd(swd::configure::ConfigureRequest {})?;
+            Some(WireProtocol::CJtag) => {
+                // The BYPASS-scan style IR-length measurement returns
+                // unreliable TDO through this firmware's cJTAG translation.
+                // Configure the IR length from the target definition
+                // (falling back to a measuring scan only when no definition
+                // is available) and verify the link with a direct IDCODE
+                // read.
+                if !chain_is_single_tap(self.scan_chain.as_ref()) {
+                    return Err(DebugProbeError::Other(anyhow!(
+                        "cJTAG attach requires a single-TAP chain; the target \
+                         definition declares multiple TAPs"
+                    )));
+                }
+                match defined_ir_lens(self.scan_chain.as_ref()) {
+                    Some(ir_lens) => {
+                        self.send_jtag_configure(JtagConfigureRequest::new(ir_lens.clone())?)?;
+                        self.reset_jtag_state_machine()?;
+
+                        let response = JTAGAccess::read_register(self, 0x01, 32)?;
+                        let idcode = u32::from_le_bytes([
+                            response[0],
+                            response[1],
+                            response[2],
+                            response[3],
+                        ]);
+                        if !idcode_is_plausible(idcode) {
+                            return Err(DebugProbeError::Other(anyhow!(
+                                "cJTAG chain verification failed (IDCODE {idcode:#010x}). \
+                                 {CJTAG_STALE_STATE_HINT}"
+                            )));
+                        }
+                        tracing::info!("cJTAG chain verified, IDCODE: {idcode:#010x}");
+
+                        // Install a single-TAP chain from the definition so
+                        // select_target can derive the chain parameters.
+                        self.jtag_driver_state.scan_chain = single_tap_chain(ir_lens[0], idcode);
+                        self.select_target(0)?;
+
+                        // On a freshly powered target, the first IR update
+                        // after the cJTAG activation does not take effect,
+                        // while DR traffic works: the first real instruction
+                        // switch reads back a zeroed register. Forgetting the
+                        // cached IR here reloads the unchanged instruction
+                        // (IDCODE), absorbing that first update so the next
+                        // switch lands.
+                        self.jtag_driver_state.current_ir_reg = u32::MAX;
+                        let _ = JTAGAccess::read_register(self, 0x01, 32)?;
+                    }
+                    None => {
+                        // No target definition available: fall back to the
+                        // measuring scan.
+                        self.scan_chain().map_err(cjtag_scan_failure)?;
+                        self.select_target(0)?;
+                    }
+                }
+            }
+            _ => {
+                self.configure_swd(swd::configure::ConfigureRequest {})?;
+            }
         }
 
         // Tell the probe we are connected so it can turn on an LED.
@@ -925,11 +984,23 @@ impl DebugProbe for CmsisDap {
         self: Box<Self>,
     ) -> Result<Box<dyn UninitializedArmProbe + 'probe>, (Box<dyn DebugProbe>, DebugProbeError)>
     {
+        if self.protocol == Some(WireProtocol::CJtag) {
+            // ARM debug sequences drive SWJ line-reset patterns that are
+            // undefined on an OScan1-active probe; only the RISC-V
+            // interface is offered for cJTAG.
+            return Err((
+                DebugProbe::into_probe(self),
+                DebugProbeError::UnsupportedProtocol(WireProtocol::CJtag),
+            ));
+        }
         Ok(Box::new(ArmCommunicationInterface::new(self, false)))
     }
 
     fn has_arm_interface(&self) -> bool {
-        true
+        // See try_get_arm_interface: the ARM interface is gated off for
+        // cJTAG so autoprobe cannot push SWD line-reset patterns into a
+        // probe whose firmware is driving an OScan1 link.
+        arm_capable(self.protocol)
     }
 
     fn try_get_riscv_interface_builder<'probe>(
@@ -945,7 +1016,12 @@ impl DebugProbe for CmsisDap {
     }
 
     fn has_riscv_interface(&self) -> bool {
-        self.capabilities._jtag_implemented
+        // cJTAG is the 2-pin encoding of the JTAG transport; the RISC-V
+        // interface follows the union of both capability bits.
+        riscv_capable(
+            self.capabilities._jtag_implemented,
+            self.capabilities._cjtag_implemented,
+        )
     }
 
     fn try_get_xtensa_interface<'probe>(
@@ -1087,10 +1163,7 @@ impl RawDapAccess for CmsisDap {
 
     fn configure_jtag(&mut self, skip_scan: bool) -> Result<(), DebugProbeError> {
         let ir_lengths = if skip_scan {
-            self.scan_chain
-                .as_ref()
-                .map(|chain| chain.iter().filter_map(|s| s.ir_len).collect::<Vec<u8>>())
-                .unwrap_or_default()
+            defined_ir_lens(self.scan_chain.as_ref()).unwrap_or_default()
         } else {
             let chain = self.jtag_scan(
                 self.scan_chain
@@ -1108,6 +1181,12 @@ impl RawDapAccess for CmsisDap {
         };
         tracing::info!("Configuring JTAG with ir lengths: {:?}", ir_lengths);
         self.send_jtag_configure(JtagConfigureRequest::new(ir_lengths)?)?;
+
+        // The firmware may reset the TAP while processing the configure
+        // command; re-reset to a known state afterwards. For cJTAG this
+        // routes through the reset_jtag_state_machine override
+        // (software-only sync), keeping OScan1 intact.
+        self.reset_jtag_state_machine()?;
 
         Ok(())
     }
@@ -1771,6 +1850,70 @@ fn push_shift_bit(
     Ok(())
 }
 
+/// Recovery hint appended to cJTAG chain failures whose cause can outlive
+/// a reconnect.
+const CJTAG_STALE_STATE_HINT: &str =
+    "This state can persist across reconnects - power-cycle the target board and retry";
+
+/// A preceding cJTAG session can leave the TAP in compact mode, which the
+/// probe firmware never exits on its own. An all-ones SWJ sequence this
+/// long drives TMS through Test-Logic-Reset (five TMS-high cycles suffice)
+/// and covers the SWD/JTAG-DP switch patterns, so the 4-pin scan starts
+/// from a known TAP state.
+const SWJ_TAP_RECOVERY_BITS: u8 = 16;
+const SWJ_TAP_RECOVERY_PATTERN: u64 = 0xFFFF;
+
+/// IR lengths declared by the target definition, if it provides any.
+fn defined_ir_lens(chain: Option<&Vec<ScanChainElement>>) -> Option<Vec<u8>> {
+    chain
+        .map(|chain| chain.iter().filter_map(|s| s.ir_len).collect::<Vec<u8>>())
+        .filter(|lens| !lens.is_empty())
+}
+
+/// A cJTAG attach drives exactly one TAP. A chain declaring more than
+/// one element cannot be represented by the single-TAP driver model:
+/// keeping only the first length would misalign every scan through the
+/// remaining physical TAPs. No chain declared (yet) is fine — the
+/// measuring-scan fallback handles it.
+fn chain_is_single_tap(chain: Option<&Vec<ScanChainElement>>) -> bool {
+    chain.map(|chain| chain.len() == 1).unwrap_or(true)
+}
+
+/// Weak sanity check for an IDCODE capture: all-zero and all-one indicate
+/// an unconnected or stuck TDO line rather than a real device.
+fn idcode_is_plausible(idcode: u32) -> bool {
+    idcode != 0 && idcode != 0xFFFF_FFFF
+}
+
+/// Build a single-TAP chain entry so `select_target` can derive the chain
+/// parameters from a target definition.
+fn single_tap_chain(ir_len: u8, idcode: u32) -> Vec<JtagChainItem> {
+    vec![JtagChainItem {
+        irlen: ir_len as usize,
+        idcode: Some(IdCode(idcode)),
+    }]
+}
+
+/// Map a chain-scan failure under cJTAG to an actionable error: the scan
+/// can fail because of stale compact-mode state that survives reconnects.
+fn cjtag_scan_failure(e: DebugProbeError) -> DebugProbeError {
+    DebugProbeError::Other(anyhow!(
+        "{e}; cJTAG chain scan failed (IDCODE invalid). {CJTAG_STALE_STATE_HINT}"
+    ))
+}
+
+/// cJTAG is the 2-pin encoding of the JTAG transport, so the RISC-V
+/// interface follows the union of both capability bits.
+fn riscv_capable(jtag_implemented: bool, cjtag_implemented: bool) -> bool {
+    jtag_implemented || cjtag_implemented
+}
+
+/// ARM debug sequences drive SWJ line-reset patterns that are undefined on
+/// an OScan1-active probe, so the ARM interface is unavailable under cJTAG.
+fn arm_capable(protocol: Option<WireProtocol>) -> bool {
+    protocol != Some(WireProtocol::CJtag)
+}
+
 #[cfg(test)]
 mod cjtag_tests {
     use super::*;
@@ -1851,6 +1994,92 @@ mod cjtag_tests {
             .unwrap();
         }
         assert!(jtag_sequences.len() < 6);
+    }
+
+    #[test]
+    fn ir_lens_from_target_definition() {
+        let defined = ScanChainElement {
+            name: None,
+            ir_len: Some(5),
+        };
+        let undefined = ScanChainElement {
+            name: None,
+            ir_len: None,
+        };
+        assert_eq!(defined_ir_lens(Some(&vec![defined.clone()])), Some(vec![5]));
+        // Elements without a declared IR length contribute nothing.
+        assert_eq!(defined_ir_lens(Some(&vec![undefined.clone()])), None);
+        // A partially declared chain yields the declared lengths only.
+        assert_eq!(
+            defined_ir_lens(Some(&vec![defined, undefined])),
+            Some(vec![5])
+        );
+        assert_eq!(defined_ir_lens(Some(&vec![])), None);
+        assert_eq!(defined_ir_lens(None), None);
+    }
+
+    #[test]
+    fn multi_tap_definitions_are_not_single_tap() {
+        let defined = ScanChainElement {
+            name: None,
+            ir_len: Some(5),
+        };
+        let undefined = ScanChainElement {
+            name: None,
+            ir_len: None,
+        };
+        // No chain (yet) and a single declared TAP are fine.
+        assert!(chain_is_single_tap(None));
+        assert!(chain_is_single_tap(Some(&vec![defined.clone()])));
+        // Two physical TAPs are out of the single-TAP driver model,
+        // including the partially declared variant.
+        assert!(!chain_is_single_tap(Some(&vec![defined, undefined])));
+    }
+
+    #[test]
+    fn implausible_idcodes_rejected() {
+        assert!(!idcode_is_plausible(0x0000_0000));
+        assert!(!idcode_is_plausible(0xFFFF_FFFF));
+        assert!(idcode_is_plausible(0x0000_001F));
+    }
+
+    #[test]
+    fn riscv_interface_follows_union_of_capability_bits() {
+        assert!(riscv_capable(true, true));
+        assert!(riscv_capable(false, true));
+        assert!(riscv_capable(true, false));
+        assert!(!riscv_capable(false, false));
+    }
+
+    #[test]
+    fn arm_interface_gated_off_for_cjtag() {
+        assert!(!arm_capable(Some(WireProtocol::CJtag)));
+        assert!(arm_capable(Some(WireProtocol::Jtag)));
+        assert!(arm_capable(Some(WireProtocol::Swd)));
+        assert!(arm_capable(None));
+    }
+
+    #[test]
+    fn cjtag_scan_failure_includes_recovery_hint() {
+        // The source message deliberately does not collide with the fixed
+        // suffix text, so the assertion proves the source is interpolated.
+        let err = cjtag_scan_failure(DebugProbeError::Other(anyhow!("dap transfer stalled")));
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cJTAG chain scan failed"), "{msg}");
+        // The underlying failure stays visible.
+        assert!(msg.contains("dap transfer stalled"), "{msg}");
+        assert!(msg.contains("power-cycle the target board"), "{msg}");
+    }
+
+    #[test]
+    fn swj_tap_recovery_covers_tap_reset() {
+        // Only the low SWJ_TAP_RECOVERY_BITS bits of the pattern are
+        // transmitted; they must all be ones so the sequence passes through
+        // Test-Logic-Reset (five TMS-high cycles suffice). The width is
+        // pinned to cover the SWD/JTAG-DP switch patterns.
+        let transmitted = (1u64 << SWJ_TAP_RECOVERY_BITS) - 1;
+        assert_eq!(SWJ_TAP_RECOVERY_PATTERN & transmitted, transmitted);
+        assert_eq!(SWJ_TAP_RECOVERY_BITS, 16);
     }
 }
 
