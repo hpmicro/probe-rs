@@ -135,6 +135,7 @@ pub struct Capabilities {
     pub(crate) swo_streaming_trace_implemented: bool,
     pub(crate) _uart_communication_port_implemented: bool,
     pub(crate) uart_com_port_implemented: bool,
+    pub(crate) _cjtag_implemented: bool,
 }
 
 impl ParseFromResponse for Capabilities {
@@ -152,15 +153,43 @@ impl ParseFromResponse for Capabilities {
                 swo_streaming_trace_implemented: buffer[1] & 0x40 > 0,
                 _uart_communication_port_implemented: buffer[1] & 0x80 > 0,
                 uart_com_port_implemented: false,
+                _cjtag_implemented: false,
             };
 
             if buffer[0] >= 2 {
-                capabilites.uart_com_port_implemented = buffer[2] & (1 << 0) != 0
+                capabilites.uart_com_port_implemented = buffer[2] & (1 << 0) != 0;
+                // Vendor capability bit 9 (0x200): cJTAG (IEEE 1149.7)
+                // support. Firmware that implements it reports exactly 2 bytes.
+                capabilites._cjtag_implemented = buffer[2] & 0x02 != 0;
             }
 
             Ok(capabilites)
         } else {
             Err(SendError::UnexpectedAnswer)
         }
+    }
+}
+
+#[cfg(test)]
+mod cjtag_tests {
+    use super::*;
+
+    fn parse(cap_len: u8, bytes: &[u8]) -> Capabilities {
+        // response buffer layout: [len, b1, b2, ...]
+        let mut buf = vec![cap_len];
+        buf.extend_from_slice(bytes);
+        Capabilities::from_response(&buf).unwrap()
+    }
+
+    #[test]
+    fn cjtag_bit_requires_two_byte_response() {
+        // 1-byte response (older firmware): cjtag stays false regardless of bits
+        assert!(!parse(1, &[0x03])._cjtag_implemented);
+        // 2-byte response, bit 9 clear
+        assert!(!parse(2, &[0x03, 0x00])._cjtag_implemented);
+        // 2-byte response, bit 9 set (0x200 -> buffer[2] & 0x02)
+        assert!(parse(2, &[0x03, 0x02])._cjtag_implemented);
+        // 3-byte response, bit 9 set, other bits irrelevant
+        assert!(parse(3, &[0x03, 0x02, 0xFF])._cjtag_implemented);
     }
 }

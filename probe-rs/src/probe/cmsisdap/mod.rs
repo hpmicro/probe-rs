@@ -875,6 +875,10 @@ impl DebugProbe for CmsisDap {
                 self.protocol = Some(WireProtocol::Swd);
                 Ok(())
             }
+            WireProtocol::CJtag if self.capabilities._cjtag_implemented => {
+                self.protocol = Some(WireProtocol::CJtag);
+                Ok(())
+            }
             _ => Err(DebugProbeError::UnsupportedProtocol(protocol)),
         }
     }
