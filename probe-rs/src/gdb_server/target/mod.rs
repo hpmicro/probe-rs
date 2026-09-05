@@ -1,6 +1,7 @@
 mod base;
 mod breakpoints;
 mod desc;
+mod flash;
 mod monitor;
 mod resume;
 mod thread;
@@ -8,6 +9,7 @@ mod traits;
 mod utils;
 
 use super::arch::RuntimeArch;
+use crate::flashing::FlashLoader;
 use crate::{BreakpointCause, CoreStatus, Error, HaltReason, Session};
 use gdbstub::stub::state_machine::GdbStubStateMachine;
 use parking_lot::FairMutex;
@@ -21,6 +23,7 @@ use gdbstub::conn::ConnectionExt;
 use gdbstub::stub::{GdbStub, MultiThreadStopReason};
 use gdbstub::target::ext::base::BaseOps;
 use gdbstub::target::ext::breakpoints::BreakpointsOps;
+use gdbstub::target::ext::flash::FlashOps;
 use gdbstub::target::ext::memory_map::MemoryMapOps;
 use gdbstub::target::ext::monitor_cmd::MonitorCmdOps;
 use gdbstub::target::ext::target_description_xml_override::TargetDescriptionXmlOverrideOps;
@@ -47,6 +50,17 @@ pub(crate) struct RuntimeTarget<'a> {
     session: &'a FairMutex<Session>,
     /// A list of core IDs for this stub
     cores: Vec<usize>,
+    /// Buffered flash data of an in-flight GDB `load` (the vFlashWrite
+    /// packets); committed and cleared on vFlashDone. RuntimeTarget is
+    /// reused across GDB connections, so a new connection also clears it.
+    flash_loader: Option<FlashLoader>,
+    /// Whether a vFlashErase was seen without any buffered write data —
+    /// used to fail erase-only transactions (GDB `flash-erase`) loudly.
+    saw_flash_erase: bool,
+    /// Highest end address of the data buffered for the current GDB
+    /// `load`; a subsequent write below it marks the start of a new
+    /// load whose predecessor aborted without a vFlashDone.
+    flash_high_water: Option<u64>,
 
     /// TCP listener accepting incoming connections
     listener: TcpListener,
@@ -72,6 +86,9 @@ impl<'a> RuntimeTarget<'a> {
         Ok(Self {
             session,
             cores,
+            flash_loader: None,
+            saw_flash_erase: false,
+            flash_high_water: None,
             listener,
             gdb: None,
             resume_action: (0, ResumeAction::Unchanged),
@@ -89,6 +106,12 @@ impl<'a> RuntimeTarget<'a> {
             match self.listener.accept() {
                 Ok((s, addr)) => {
                     tracing::info!("New connection from {:#?}", addr);
+
+                    // A new GDB connection must not inherit uncommitted
+                    // flash data buffered by an aborted load.
+                    self.flash_loader = None;
+                    self.saw_flash_erase = false;
+                    self.flash_high_water = None;
 
                     for i in 0..self.cores.len() {
                         let core_id = self.cores[i];
@@ -261,6 +284,10 @@ impl Target for RuntimeTarget<'_> {
     }
 
     fn support_monitor_cmd(&mut self) -> Option<MonitorCmdOps<'_, Self>> {
+        Some(self)
+    }
+
+    fn support_flash_operations(&mut self) -> Option<FlashOps<'_, Self>> {
         Some(self)
     }
 
