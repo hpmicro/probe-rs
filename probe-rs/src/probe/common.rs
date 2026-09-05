@@ -402,6 +402,12 @@ impl Default for JtagDriverState {
 
 /// A trait for implementing low-level JTAG interface operations.
 pub(crate) trait RawJtagIo {
+    /// Contract for both `shift_bit` and `shift_bits`: implementations
+    /// must leave the tracked TAP state exactly as if every emitted
+    /// clock had been processed by the reference per-bit state machine -
+    /// the tracker advances as clocks are ACCEPTED INTO THE QUEUE, not
+    /// when the queue is later flushed, because batch preparation
+    /// navigates via the tracked state between flushes.
     /// Returns a mutable reference to the current state.
     fn state_mut(&mut self) -> &mut JtagDriverState;
 

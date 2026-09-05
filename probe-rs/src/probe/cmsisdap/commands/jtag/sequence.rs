@@ -3,7 +3,7 @@ use super::super::{CmsisDapError, CommandId, Request, SendError, Status};
 
 use bitvec::prelude::*;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sequence {
     /// Number of TCK cycles: 1..64 (64 encoded as 0)
     tck_cycles: u8,
@@ -110,6 +110,31 @@ impl Sequence {
         } else {
             Err(())
         }
+    }
+
+    /// Append up to `count` clocks taken from the packed TDI bits (bit i
+    /// at `tdi_bits[i/8] >> (i%8)`), merging only while the (tms,
+    /// capture) pair matches and the 64-clock bound leaves room. Returns
+    /// how many clocks were taken - the batch-shaped counterpart of
+    /// repeatedly calling [`Sequence::append`].
+    pub(crate) fn append_bits(
+        &mut self,
+        tms: bool,
+        capture: bool,
+        tdi_bits: &[u8; 8],
+        count: usize,
+    ) -> usize {
+        if self.tms != tms || self.tdo_capture != capture {
+            return 0;
+        }
+        let take = (64 - self.tck_cycles as usize).min(count);
+        let start = self.tck_cycles as usize;
+        for i in 0..take {
+            let bit = (tdi_bits[i / 8] >> (i % 8)) & 1;
+            self.data[(start + i) / 8] |= bit << ((start + i) % 8);
+        }
+        self.tck_cycles += take as u8;
+        take
     }
     /// Number of TDO bits this sequence contributes to the response
     /// (the wire format pads every captured sequence to a whole number

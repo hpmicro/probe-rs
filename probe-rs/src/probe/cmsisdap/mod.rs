@@ -1277,18 +1277,29 @@ impl RawJtagIo for CmsisDap {
         &mut self.jtag_driver_state
     }
     fn shift_bit(&mut self, tms: bool, tdi: bool, capture: bool) -> Result<(), DebugProbeError> {
-        self.jtag_driver_state.state.update(tms);
-        if let Some(sequence) = self.jtag_sequences.last_mut() {
-            if sequence.append(tms, tdi, capture).is_ok() {
-                return Ok(());
-            }
-        }
-        self.jtag_sequences.push(JtagSequence::new(
-            1,
-            capture,
+        shift_bit_with(
             tms,
-            [u8::from(tdi), 0, 0, 0, 0, 0, 0, 0],
-        )?);
+            tdi,
+            capture,
+            &mut self.jtag_sequences,
+            &mut self.jtag_driver_state,
+        );
+        Ok(())
+    }
+
+    fn shift_bits(
+        &mut self,
+        tms: impl IntoIterator<Item = bool>,
+        tdi: impl IntoIterator<Item = bool>,
+        cap: impl IntoIterator<Item = bool>,
+    ) -> Result<(), DebugProbeError> {
+        encode_shift_bits_with(
+            tms,
+            tdi,
+            cap,
+            &mut self.jtag_sequences,
+            &mut self.jtag_driver_state,
+        );
         Ok(())
     }
     fn read_captured_bits(&mut self) -> Result<BitVec<u8, Lsb0>, DebugProbeError> {
@@ -1443,6 +1454,97 @@ fn read_captured_bits_with(
         capture.extend_from_bitslice(&slice_sequence_captures(&batch, &response_bytes)?);
     }
     Ok(capture)
+}
+
+/// Per-clock encoding primitive: advance the tracked TAP state and merge
+/// the clock into the queue tail, starting a fresh sequence when the
+/// (tms, capture) pair changes or the tail is full. Extracted from the
+/// `CmsisDap::shift_bit` body so the per-bit semantics are testable and
+/// serve as the reference side of the batch encoder's differential
+/// tests.
+pub(crate) fn shift_bit_with(
+    tms: bool,
+    tdi: bool,
+    capture: bool,
+    queue: &mut Vec<JtagSequence>,
+    state: &mut JtagDriverState,
+) {
+    state.state.update(tms);
+    let merged = queue
+        .last_mut()
+        .map(|seq| seq.append(tms, tdi, capture).is_ok())
+        .unwrap_or(false);
+    if !merged {
+        queue.push(
+            JtagSequence::new(1, capture, tms, [u8::from(tdi), 0, 0, 0, 0, 0, 0, 0])
+                .expect("a single-clock sequence is always within the 1..=64 bound"),
+        );
+    }
+}
+
+/// Encode a shift_bits triple into the sequence queue with per-clock
+/// semantics bit-identical to feeding every clock through
+/// [`shift_bit_with`]: a sequence boundary appears only where the (tms,
+/// capture) pair changes or the 64-clock bound forces a chunk, and the
+/// queue tail participates in merging exactly as the per-bit path would
+/// (partial merges included). Unlike the per-bit loop, a same-pair
+/// stretch packs its TDI bits straight into the sequence data bytes at
+/// run granularity, which removes the per-clock host cost.
+pub(crate) fn encode_shift_bits_with<I1, I2, I3>(
+    tms: I1,
+    tdi: I2,
+    cap: I3,
+    queue: &mut Vec<JtagSequence>,
+    state: &mut JtagDriverState,
+) where
+    I1: IntoIterator<Item = bool>,
+    I2: IntoIterator<Item = bool>,
+    I3: IntoIterator<Item = bool>,
+{
+    let mut run: Option<(bool, bool, [u8; 8], usize)> = None;
+    for ((tms, tdi), cap) in tms.into_iter().zip(tdi).zip(cap) {
+        state.state.update(tms);
+        match &mut run {
+            Some((r_tms, r_cap, bits, len)) if *r_tms == tms && *r_cap == cap && *len < 64 => {
+                bits[*len / 8] |= u8::from(tdi) << (*len % 8);
+                *len += 1;
+            }
+            _ => {
+                flush_run(run.take(), queue);
+                let mut bits = [0u8; 8];
+                bits[0] = u8::from(tdi);
+                run = Some((tms, cap, bits, 1));
+            }
+        }
+    }
+    flush_run(run.take(), queue);
+}
+
+/// Commit one completed (tms, capture) run into the queue with per-clock
+/// merge semantics: clocks first extend a same-pair tail up to its
+/// remaining 64-clock capacity, and the remainder becomes a fresh
+/// sequence. A committed run never exceeds 64 clocks, so at most one
+/// fresh sequence is created.
+fn flush_run(run: Option<(bool, bool, [u8; 8], usize)>, queue: &mut Vec<JtagSequence>) {
+    let Some((tms, cap, bits, mut len)) = run else {
+        return;
+    };
+    let mut taken = 0;
+    if let Some(tail) = queue.last_mut() {
+        taken = tail.append_bits(tms, cap, &bits, len);
+        len -= taken;
+    }
+    if len > 0 {
+        let mut shifted = [0u8; 8];
+        for i in 0..len {
+            let bit = (bits[(taken + i) / 8] >> ((taken + i) % 8)) & 1;
+            shifted[i / 8] |= bit << (i % 8);
+        }
+        queue.push(
+            JtagSequence::new(len as u8, cap, tms, shifted)
+                .expect("a committed run never exceeds the 64-clock bound"),
+        );
+    }
 }
 
 impl From<ScanChainError> for CmsisDapError {
@@ -1619,5 +1721,175 @@ mod sequence_capture_tests {
         let extracted: Vec<bool> = capture.iter().by_vals().collect();
         assert_eq!(&extracted[..41], &first[..]);
         assert_eq!(&extracted[41..], &second[..]);
+    }
+}
+
+#[cfg(test)]
+mod batch_encode_tests {
+    use super::*;
+
+    /// The production per-bit primitive, driven clock by clock: the
+    /// reference side of every differential assertion.
+    fn reference(clocks: &[(bool, bool, bool)]) -> (Vec<JtagSequence>, JtagDriverState) {
+        let mut queue = Vec::new();
+        let mut state = JtagDriverState::default();
+        for &(tms, tdi, cap) in clocks {
+            shift_bit_with(tms, tdi, cap, &mut queue, &mut state);
+        }
+        (queue, state)
+    }
+
+    fn batch(clocks: &[(bool, bool, bool)]) -> (Vec<JtagSequence>, JtagDriverState) {
+        let mut queue = Vec::new();
+        let mut state = JtagDriverState::default();
+        encode_shift_bits_with(
+            clocks.iter().map(|c| c.0),
+            clocks.iter().map(|c| c.1),
+            clocks.iter().map(|c| c.2),
+            &mut queue,
+            &mut state,
+        );
+        (queue, state)
+    }
+
+    fn assert_bit_identical(name: &str, clocks: &[(bool, bool, bool)]) {
+        let (rq, rs) = reference(clocks);
+        let (bq, bs) = batch(clocks);
+        assert_eq!(rq.len(), bq.len(), "{name}: sequence count differs");
+        assert_eq!(rq, bq, "{name}: sequence vectors differ");
+        assert_eq!(rs.state, bs.state, "{name}: tracked TAP state differs");
+    }
+
+    /// A data word of pseudo-random TDI bits (bit diversity matters:
+    /// equal-bit runs would not catch data packing bugs).
+    struct BitSource(u8);
+    impl BitSource {
+        fn next(&mut self) -> bool {
+            self.0 = self.0.rotate_left(3) ^ 0x5A;
+            self.0 & 1 == 1
+        }
+    }
+
+    /// 41-bit DMI DR write scan shape: navigation into Shift-DR, 40 data
+    /// clocks under TMS=0, the final data bit riding the TMS=1 exit
+    /// clock (captured), Update-DR, return to idle, then idle clocks.
+    fn dmi_write_scan(idle: usize, seed: u8) -> Vec<(bool, bool, bool)> {
+        let mut bits = BitSource(seed);
+        let mut clocks = vec![
+            (true, false, false), // navigate toward Shift-DR
+            (false, false, false),
+            (false, false, false),
+        ];
+        for _ in 0..40 {
+            clocks.push((false, bits.next(), true));
+        }
+        clocks.push((true, bits.next(), true)); // exit clock carries the last data bit
+        clocks.push((true, false, false)); // Update-DR
+        clocks.push((false, false, false)); // back to idle
+        for _ in 0..idle {
+            clocks.push((false, false, false));
+        }
+        clocks
+    }
+
+    #[test]
+    fn dmi_scan_shape_idle0_and_idle3() {
+        assert_bit_identical("dmi idle=0", &dmi_write_scan(0, 0x1F));
+        assert_bit_identical("dmi idle=3", &dmi_write_scan(3, 0xA7));
+    }
+
+    #[test]
+    fn multi_tap_bypass_capture_toggles_inside_a_run() {
+        // drpre/drpost bypass clocks switch capture false->true->false
+        // inside a single constant-TMS run: the (tms, capture) pair, not
+        // TMS alone, must gate sequence boundaries.
+        let mut bits = BitSource(0x33);
+        let mut clocks: Vec<(bool, bool, bool)> = (0..3).map(|_| (false, false, false)).collect();
+        for _ in 0..41 {
+            clocks.push((false, bits.next(), true));
+        }
+        clocks.extend((0..2).map(|_| (false, false, false)));
+        assert_bit_identical("multi-tap bypass", &clocks);
+    }
+
+    #[test]
+    fn runs_longer_than_64_chunk() {
+        let mut bits = BitSource(0x71);
+        let mut clocks: Vec<(bool, bool, bool)> =
+            (0..260).map(|_| (false, bits.next(), true)).collect();
+        clocks.extend((0..130).map(|_| (false, false, false)));
+        assert_bit_identical("long runs", &clocks);
+    }
+
+    #[test]
+    fn cross_call_merge_at_the_64_boundary() {
+        // A (tms=0, capture=false) tail of 3 clocks meeting a 100-clock
+        // same-pair run: the per-bit reference merges 61 clocks into the
+        // tail and starts a 39-clock sequence; the batch encoder must do
+        // exactly the same, not an all-or-nothing merge.
+        for tail in 1..63 {
+            let mut rq = Vec::new();
+            let mut rs = JtagDriverState::default();
+            for _ in 0..tail {
+                shift_bit_with(false, false, false, &mut rq, &mut rs);
+            }
+            let mut bq = rq.clone();
+            let mut bs = JtagDriverState::default();
+            bs.state = rs.state;
+            let run: Vec<(bool, bool, bool)> =
+                (0..100).map(|i| (false, i % 3 == 0, false)).collect();
+            for &(tms, tdi, cap) in &run {
+                shift_bit_with(tms, tdi, cap, &mut rq, &mut rs);
+            }
+            encode_shift_bits_with(
+                run.iter().map(|c| c.0),
+                run.iter().map(|c| c.1),
+                run.iter().map(|c| c.2),
+                &mut bq,
+                &mut bs,
+            );
+            assert_eq!(rq, bq, "tail {tail}: sequences differ");
+            assert_eq!(rs.state, bs.state, "tail {tail}: state diverges");
+        }
+    }
+
+    #[test]
+    fn infinite_iterators_follow_zip_shortest() {
+        // tms finite, tdi/cap infinite: the tms iterator is the length
+        // authority, exactly like the per-bit default implementation.
+        let tms = [true, false, false, false, false, false];
+        let clocks: Vec<(bool, bool, bool)> = tms.iter().map(|&t| (t, false, false)).collect();
+        let (rq, rs) = reference(&clocks);
+
+        let mut bq = Vec::new();
+        let mut bs = JtagDriverState::default();
+        encode_shift_bits_with(
+            tms,
+            std::iter::repeat(false),
+            std::iter::repeat(false),
+            &mut bq,
+            &mut bs,
+        );
+        assert_eq!(rq, bq);
+        assert_eq!(rs.state, bs.state);
+    }
+
+    #[test]
+    fn capture_toggles_produce_many_small_runs() {
+        let mut clocks = Vec::new();
+        for i in 0..90 {
+            clocks.push((false, i % 5 == 0, i % 3 == 0));
+        }
+        assert_bit_identical("capture toggles", &clocks);
+    }
+
+    #[test]
+    fn prefix_state_tracking_matches_reference() {
+        let clocks = dmi_write_scan(2, 0x9D);
+        for k in [1usize, 7, 45, 48] {
+            let (_, rs) = reference(&clocks[..k]);
+            let (_, bs) = batch(&clocks[..k]);
+            assert_eq!(rs.state, bs.state, "prefix k={k}: state diverges");
+        }
     }
 }
