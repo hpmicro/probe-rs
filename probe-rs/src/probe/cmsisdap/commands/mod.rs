@@ -12,7 +12,7 @@ use std::io::ErrorKind;
 use std::str::Utf8Error;
 use std::time::Duration;
 
-const USB_TIMEOUT: Duration = Duration::from_millis(1000);
+pub(super) const USB_TIMEOUT: Duration = Duration::from_millis(1000);
 
 #[derive(Debug, thiserror::Error)]
 pub enum CmsisDapError {
@@ -84,13 +84,89 @@ pub enum CmsisDapDevice {
     /// CMSIS-DAP v2 over WinUSB/Bulk.
     /// Stores an usb device handle, out/in EP addresses, maximum DAP packet size,
     /// and an optional SWO streaming EP address and SWO maximum packet size.
+    /// The queues allow several commands to be in flight at once - the
+    /// device reports how many it can keep buffered.
     V2 {
         handle: nusb::Interface,
         out_ep: u8,
         in_ep: u8,
+        out_queue: nusb::transfer::Queue<Vec<u8>>,
+        in_queue: nusb::transfer::Queue<nusb::transfer::RequestBuffer>,
         max_packet_size: usize,
         swo_ep: Option<(u8, usize)>,
     },
+}
+
+impl CmsisDapDevice {
+    /// Number of commands that may be submitted before the oldest
+    /// response has to be collected. Bulk devices buffer several
+    /// packets (the packet count they report); HID is strictly
+    /// request-response.
+    pub(super) fn pipeline_depth(&self) -> usize {
+        match self {
+            CmsisDapDevice::V1 { .. } => 1,
+            CmsisDapDevice::V2 { .. } => 8,
+        }
+    }
+
+    /// Submit one encoded command (leading report-id byte included, as
+    /// the synchronous send path produces) without waiting for its
+    /// response. Responses complete in submission order; collect them
+    /// with [`CmsisDapDevice::collect_response`].
+    pub(super) fn submit_buffer(
+        &mut self,
+        buffer: &[u8],
+        response_capacity: usize,
+    ) -> Result<(), SendError> {
+        match self {
+            CmsisDapDevice::V1 { handle, .. } => {
+                handle.write(buffer)?;
+                Ok(())
+            }
+            CmsisDapDevice::V2 {
+                out_queue,
+                in_queue,
+                ..
+            } => {
+                // Skip the report-id byte, as the synchronous path does,
+                // and reserve the matching inbound buffer up front so
+                // the response can land while later commands are still
+                // being submitted.
+                out_queue.submit(buffer[1..].to_vec());
+                in_queue
+                    .submit(nusb::transfer::RequestBuffer::new(response_capacity));
+                Ok(())
+            }
+        }
+    }
+
+    /// Collect the oldest uncollected response; only valid after a
+    /// matching [`CmsisDapDevice::submit_buffer`].
+    pub(super) fn collect_response(
+        &mut self,
+        packet_size: usize,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<u8>, SendError> {
+        match self {
+            CmsisDapDevice::V1 {
+                handle, report_size, ..
+            } => {
+                let mut buf = vec![0u8; *report_size + 1];
+                let n = match handle.read_timeout(&mut buf, timeout.as_millis() as i32)? {
+                    0 => return Err(SendError::Timeout),
+                    n => n,
+                };
+                Ok(buf[..n].to_vec())
+            }
+            CmsisDapDevice::V2 { in_queue, .. } => {
+                let comp = async_io::block_on(in_queue.next_complete());
+                comp.status
+                    .map_err(|e| SendError::UsbError(std::io::Error::other(e)))?;
+                let _ = (packet_size, timeout);
+                Ok(comp.data)
+            }
+        }
+    }
 }
 
 impl CmsisDapDevice {
@@ -126,7 +202,7 @@ impl CmsisDapDevice {
     /// Drain any pending data from the probe, ensuring future responses are
     /// synchronised to requests. Swallows any errors, which are expected if
     /// there is no pending data to read.
-    pub(super) fn drain(&self) {
+    pub(super) fn drain(&mut self) {
         tracing::debug!("Draining probe of any pending data.");
 
         match self {
@@ -135,7 +211,7 @@ impl CmsisDapDevice {
                 report_size,
                 ..
             } => loop {
-                let mut discard = vec![0u8; report_size + 1];
+                let mut discard = vec![0u8; *report_size + 1];
                 match handle.read_timeout(&mut discard, 1) {
                     Ok(n) if n != 0 => continue,
                     _ => break,
@@ -146,8 +222,16 @@ impl CmsisDapDevice {
                 handle,
                 in_ep,
                 max_packet_size,
+                in_queue,
                 ..
             } => {
+                // Cancel any inbound transfers the pipeline still has
+                // posted first: a posted transfer swallows the response
+                // data before the plain reads below can see it, which
+                // would leave the device holding stale responses that
+                // desynchronize the next program that opens the probe.
+                in_queue.cancel_all();
+
                 let timeout = Duration::from_millis(1);
                 let mut discard = vec![0u8; *max_packet_size];
                 loop {

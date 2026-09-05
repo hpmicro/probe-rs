@@ -1306,18 +1306,93 @@ impl RawJtagIo for CmsisDap {
         // The queue leaves the driver up front: whatever happens on the
         // wire, no stale sequence survives into the next transfer.
         let mut sequences = std::mem::take(&mut self.jtag_sequences);
-        let packet_size = self.packet_size;
-        read_captured_bits_with(&mut sequences, packet_size, |batch| {
-            let response = self.send_jtag_sequences(JtagSequenceRequest::new(batch.clone())?)?;
-            Ok(response)
-        })
+        let mut transport = DeviceTransport {
+            device: &mut self.device,
+            packet_size: self.packet_size,
+        };
+        read_captured_bits_pipelined(
+            &mut sequences,
+            self.packet_size,
+            JTAG_SEQUENCES_PER_COMMAND,
+            &mut transport,
+        )
     }
+}
+
+/// Feeds encoded sequence batches straight to the device queues. Bulk
+/// devices keep several packets in flight, so the flush loop can
+/// overlap USB round trips with device execution.
+struct DeviceTransport<'a> {
+    device: &'a mut CmsisDapDevice,
+    packet_size: u16,
+}
+
+impl SequenceTransport for DeviceTransport<'_> {
+    fn depth(&self) -> usize {
+        self.device.pipeline_depth()
+    }
+
+    fn submit_batch(&mut self, batch: Vec<JtagSequence>) -> Result<(), DebugProbeError> {
+        use commands::Request;
+
+        let request = JtagSequenceRequest::new(batch).map_err(CmsisDapError::from)?;
+        let mut buffer = vec![0u8; self.packet_size as usize + 1];
+        buffer[1] = <JtagSequenceRequest as Request>::COMMAND_ID as u8;
+        let size = request
+            .to_bytes(&mut buffer[2..])
+            .map_err(|e| CmsisDapError::Send {
+                command_id: <JtagSequenceRequest as Request>::COMMAND_ID,
+                source: e,
+            })?
+            + 2;
+        buffer.truncate(size);
+
+        self.device
+            .submit_buffer(&buffer, self.packet_size as usize)
+            .map_err(|e| map_send_error(e))?;
+        Ok(())
+    }
+
+    fn collect_batch(&mut self) -> Result<Vec<u8>, DebugProbeError> {
+        use commands::{Request, SendError, Status};
+
+        let response = self
+            .device
+            .collect_response(self.packet_size as usize, commands::USB_TIMEOUT)
+            .map_err(map_send_error)?;
+
+        if response.first() != Some(&(<JtagSequenceRequest as Request>::COMMAND_ID as u8)) {
+            return Err(DebugProbeError::ProbeSpecific(Box::new(CmsisDapError::Send {
+                command_id: <JtagSequenceRequest as Request>::COMMAND_ID,
+                source: SendError::CommandIdMismatch(response.first().copied().unwrap_or(0)),
+            })));
+        }
+        let status = Status::from_byte(*response.get(1).unwrap_or(&0xFF)).map_err(map_send_error)?;
+        match status {
+            Status::DAPOk => Ok(response[2..].to_vec()),
+            Status::DAPError => Err(DebugProbeError::ProbeSpecific(Box::new(
+                CmsisDapError::ErrorResponse,
+            ))),
+        }
+    }
+}
+
+fn map_send_error(e: commands::SendError) -> DebugProbeError {
+    DebugProbeError::ProbeSpecific(Box::new(CmsisDapError::Send {
+        command_id: commands::CommandId::JtagSequence,
+        source: e,
+    }))
 }
 impl Drop for CmsisDap {
     fn drop(&mut self) {
         tracing::debug!("Detaching from CMSIS-DAP probe");
         // We ignore the error cases as we can't do much about it anyways.
         let _ = self.process_batch();
+
+        // Cancel any pipelined inbound transfers and read away whatever
+        // the device still holds, so the next program to open the probe
+        // starts from a synchronized stream.
+        self.device.drain();
 
         // If SWO is active, disable it before calling detach,
         // which ensures detach won't error on disabling SWO.
@@ -1333,7 +1408,7 @@ impl Drop for CmsisDap {
 /// count in one byte (maximum 255); the packet byte budgets below are
 /// what actually bound bulk transfers, this cap only keeps any single
 /// command's response wait bounded.
-const JTAG_SEQUENCES_PER_COMMAND: usize = 50;
+const JTAG_SEQUENCES_PER_COMMAND: usize = 128;
 
 /// Wire bytes every DAP_JTAG_SEQUENCE command spends before any sequence:
 /// the command id, the sequence count byte, and one byte of report
@@ -1437,20 +1512,55 @@ fn slice_sequence_captures(
     Ok(capture)
 }
 
-/// Flush queued sequences through an injected transport and collect the
-/// captured TDO bits. The queue is consumed up front - whatever happens
-/// on the wire, no stale sequence survives into the next transfer - and
-/// the transport is a parameter so the planning, slicing, and
+/// Transport for flushing queued sequences to the probe: commands are
+/// submitted without waiting and responses come back in submission
+/// order. Parameterized so the planning, slicing, pipelining, and
 /// queue-clearing contracts are testable without hardware.
-fn read_captured_bits_with(
+pub(crate) trait SequenceTransport {
+    /// How many commands may be in flight before the oldest response
+    /// must be collected.
+    fn depth(&self) -> usize;
+
+    /// Submit one batch of sequences. The response arrives later via
+    /// [`SequenceTransport::collect`].
+    fn submit_batch(&mut self, batch: Vec<JtagSequence>) -> Result<(), DebugProbeError>;
+
+    /// Collect the TDO bytes of the oldest submitted, uncollected batch.
+    fn collect_batch(&mut self) -> Result<Vec<u8>, DebugProbeError>;
+}
+
+/// Flush queued sequences through a [`SequenceTransport`] and collect
+/// the captured TDO bits. The queue is consumed up front - whatever
+/// happens on the wire, no stale sequence survives into the next
+/// transfer - and up to `depth` commands run in flight, which is what
+/// lets a bulk probe overlap its USB round trips with device execution.
+fn read_captured_bits_pipelined(
     queue: &mut Vec<JtagSequence>,
     packet_size: u16,
-    mut send: impl FnMut(Vec<JtagSequence>) -> Result<Vec<u8>, DebugProbeError>,
+    max_per_command: usize,
+    transport: &mut impl SequenceTransport,
 ) -> Result<BitVec<u8, Lsb0>, DebugProbeError> {
     let sequences = std::mem::take(queue);
+    let batches = plan_sequence_commands(&sequences, packet_size, max_per_command)?;
+    let depth = transport.depth().max(1);
+
+    let mut responses = Vec::with_capacity(batches.len());
+    let mut in_flight = 0usize;
+    for batch in batches.iter() {
+        if in_flight >= depth {
+            responses.push(transport.collect_batch()?);
+            in_flight -= 1;
+        }
+        transport.submit_batch(batch.clone())?;
+        in_flight += 1;
+    }
+    while in_flight > 0 {
+        responses.push(transport.collect_batch()?);
+        in_flight -= 1;
+    }
+
     let mut capture = BitVec::<u8, Lsb0>::new();
-    for batch in plan_sequence_commands(&sequences, packet_size, JTAG_SEQUENCES_PER_COMMAND)? {
-        let response_bytes = send(batch.clone())?;
+    for (batch, response_bytes) in batches.into_iter().zip(responses) {
         capture.extend_from_bitslice(&slice_sequence_captures(&batch, &response_bytes)?);
     }
     Ok(capture)
@@ -1586,17 +1696,18 @@ mod sequence_capture_tests {
         assert_eq!(sizes, vec![30, 30]);
 
         // With byte room to spare (131-byte budget), the same sixty
-        // sequences split by the COUNT cap instead.
+        // sequences fit one command: neither the byte budget nor the
+        // count cap binds.
         let batches = plan_sequence_commands(&sequences, 131, JTAG_SEQUENCES_PER_COMMAND).unwrap();
         let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
-        assert_eq!(sizes, vec![50, 10]);
+        assert_eq!(sizes, vec![60]);
 
-        // Two hundred one-bit sequences under a 1021-byte budget also
-        // split by the COUNT cap.
+        // Two hundred one-bit sequences under a 1021-byte budget split
+        // by the COUNT cap instead.
         let sequences: Vec<JtagSequence> = (0..200).map(|_| bit()).collect();
         let batches = plan_sequence_commands(&sequences, 1024, JTAG_SEQUENCES_PER_COMMAND).unwrap();
         let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
-        assert_eq!(sizes, vec![50, 50, 50, 50]);
+        assert_eq!(sizes, vec![128, 72]);
 
         // Capture-dense batches: every 41-bit capture sequence answers
         // with 6 response bytes, so the response budget must bind too -
@@ -1684,9 +1795,13 @@ mod sequence_capture_tests {
         let mut queue: Vec<JtagSequence> = (0..4)
             .map(|_| JtagSequence::new(41, true, false, [0x00; 8]).unwrap())
             .collect();
-        let result = read_captured_bits_with(&mut queue, 64, |_| {
-            Err(DebugProbeError::Other(anyhow!("usb write failed")))
-        });
+        let mut transport = MockTransport::error("usb write failed");
+        let result = read_captured_bits_pipelined(
+            &mut queue,
+            64,
+            JTAG_SEQUENCES_PER_COMMAND,
+            &mut transport,
+        );
         assert!(result.is_err());
         assert!(queue.is_empty());
     }
@@ -1697,7 +1812,13 @@ mod sequence_capture_tests {
         // queue must still be empty afterwards.
         let mut queue: Vec<JtagSequence> =
             vec![JtagSequence::new(41, true, false, [0x00; 8]).unwrap()];
-        let result = read_captured_bits_with(&mut queue, 64, |_| Ok(vec![0xFF; 5]));
+        let mut transport = MockTransport::short_response();
+        let result = read_captured_bits_pipelined(
+            &mut queue,
+            64,
+            JTAG_SEQUENCES_PER_COMMAND,
+            &mut transport,
+        );
         assert!(result.is_err());
         assert!(queue.is_empty());
     }
@@ -1715,12 +1836,103 @@ mod sequence_capture_tests {
         let mut queue: Vec<JtagSequence> = (0..2)
             .map(|_| JtagSequence::new(41, true, false, [0x00; 8]).unwrap())
             .collect();
-        let capture =
-            read_captured_bits_with(&mut queue, 64, move |_batch| Ok(response.clone())).unwrap();
+        let mut transport = MockTransport::responses(vec![response]);
+        let capture = read_captured_bits_pipelined(
+            &mut queue,
+            64,
+            JTAG_SEQUENCES_PER_COMMAND,
+            &mut transport,
+        )
+        .unwrap();
         assert_eq!(capture.len(), 82);
         let extracted: Vec<bool> = capture.iter().by_vals().collect();
         assert_eq!(&extracted[..41], &first[..]);
         assert_eq!(&extracted[41..], &second[..]);
+    }
+
+    #[test]
+    fn pipelined_flush_respects_the_depth_window() {
+        // With more batches than the transport keeps in flight, submits
+        // and collects interleave: the in-flight count never exceeds the
+        // depth, every batch is submitted exactly once, and responses
+        // still pair with their batches in order.
+        let first: Vec<bool> = (0..41).map(|i| i % 5 == 0).collect();
+        let second: Vec<bool> = (0..41).map(|i| i % 3 == 0).collect();
+        let responses = vec![
+            padded_capture_stream(&first, 7),
+            padded_capture_stream(&second, 7),
+        ];
+
+        // One sequence per batch (a 4-byte packet budget splits them).
+        let mut queue: Vec<JtagSequence> = (0..2)
+            .map(|_| JtagSequence::new(41, true, false, [0x00; 8]).unwrap())
+            .collect();
+        let mut transport = MockTransport::responses(responses.clone());
+        transport.depth = 1;
+        let capture = read_captured_bits_pipelined(&mut queue, 11, 128, &mut transport).unwrap();
+        assert!(transport.max_in_flight <= 1, "depth window exceeded");
+        let extracted: Vec<bool> = capture.iter().by_vals().collect();
+        assert_eq!(&extracted[..41], &first[..]);
+        assert_eq!(&extracted[41..], &second[..]);
+    }
+
+    /// Hands back canned responses (or errors) in order and records the
+    /// in-flight watermark, so flush tests can assert on pipelining
+    /// behavior without hardware.
+    struct MockTransport {
+        canned: std::collections::VecDeque<Result<Vec<u8>, DebugProbeError>>,
+        depth: usize,
+        in_flight: usize,
+        max_in_flight: usize,
+        submitted: usize,
+    }
+
+    impl MockTransport {
+        fn responses(list: Vec<Vec<u8>>) -> Self {
+            Self {
+                canned: list.into_iter().map(Ok).collect(),
+                depth: 8,
+                in_flight: 0,
+                max_in_flight: 0,
+                submitted: 0,
+            }
+        }
+
+        fn error(message: &'static str) -> Self {
+            Self {
+                canned: [Err(DebugProbeError::Other(anyhow!(message)))]
+                    .into_iter()
+                    .collect(),
+                depth: 8,
+                in_flight: 0,
+                max_in_flight: 0,
+                submitted: 0,
+            }
+        }
+
+        fn short_response() -> Self {
+            Self::responses(vec![vec![0xFF; 5]])
+        }
+    }
+
+    impl SequenceTransport for MockTransport {
+        fn depth(&self) -> usize {
+            self.depth
+        }
+
+        fn submit_batch(&mut self, _batch: Vec<JtagSequence>) -> Result<(), DebugProbeError> {
+            self.submitted += 1;
+            self.in_flight += 1;
+            self.max_in_flight = self.max_in_flight.max(self.in_flight);
+            Ok(())
+        }
+
+        fn collect_batch(&mut self) -> Result<Vec<u8>, DebugProbeError> {
+            self.in_flight -= 1;
+            self.canned
+                .pop_front()
+                .unwrap_or_else(|| Err(DebugProbeError::Other(anyhow!("no response left"))))
+        }
     }
 }
 

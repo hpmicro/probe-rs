@@ -205,10 +205,16 @@ pub fn open_v2_device(device_info: &DeviceInfo) -> Option<CmsisDapDevice> {
             match device.claim_interface(interface.interface_number()) {
                 Ok(handle) => {
                     tracing::debug!("Opening {:04x}:{:04x} in CMSIS-DAPv2 mode", vid, pid);
+                    let out_ep = eps[0].address();
+                    let in_ep = eps[1].address();
+                    let out_queue = handle.bulk_out_queue(out_ep);
+                    let in_queue = handle.bulk_in_queue(in_ep);
                     return Some(CmsisDapDevice::V2 {
                         handle,
-                        out_ep: eps[0].address(),
-                        in_ep: eps[1].address(),
+                        out_ep,
+                        in_ep,
+                        out_queue,
+                        in_queue,
                         swo_ep,
                         max_packet_size: eps[1].max_packet_size(),
                     });
