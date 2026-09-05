@@ -484,9 +484,22 @@ fn jtag_move_to_state(
         target
     );
 
-    while let Some(tms) = protocol.state().state.step_toward(target) {
-        protocol.shift_bit(tms, false, false)?;
+    // Plan the whole TMS path on a local copy of the tracked state, then
+    // emit it as a single shift_bits call: the per-clock tracker
+    // contract (see RawJtagIo) keeps the real state in lockstep, and the
+    // batch call lets drivers encode the navigation without per-clock
+    // host work.
+    let mut planned: Vec<bool> = Vec::new();
+    let mut sim = protocol.state().state;
+    while let Some(tms) = sim.step_toward(target) {
+        sim.update(tms);
+        planned.push(tms);
     }
+    protocol.shift_bits(
+        planned.into_iter(),
+        iter::repeat(false),
+        iter::repeat(false),
+    )?;
 
     tracing::trace!("In state: {:?}", protocol.state_mut().state);
     Ok(())
@@ -906,6 +919,88 @@ mod tests {
             }
 
             assert!(transitions < 10);
+        }
+    }
+}
+
+#[cfg(test)]
+mod move_state_batch_tests {
+    use super::*;
+
+    /// Records every clock a driver emits, through the per-bit primitive:
+    /// the default `shift_bits` (used by the batched navigation) funnels
+    /// into `shift_bit`, so both navigation styles land in the same log.
+    struct Recorder {
+        driver: JtagDriverState,
+        clocks: Vec<(bool, bool, bool)>,
+    }
+
+    impl Recorder {
+        fn new(start: JtagState) -> Self {
+            let mut driver = JtagDriverState::default();
+            driver.state = start;
+            Self {
+                driver,
+                clocks: Vec::new(),
+            }
+        }
+    }
+
+    impl RawJtagIo for Recorder {
+        fn state(&self) -> &JtagDriverState {
+            &self.driver
+        }
+
+        fn state_mut(&mut self) -> &mut JtagDriverState {
+            &mut self.driver
+        }
+
+        fn shift_bit(&mut self, tms: bool, tdi: bool, cap: bool) -> Result<(), DebugProbeError> {
+            self.driver.state.update(tms);
+            self.clocks.push((tms, tdi, cap));
+            Ok(())
+        }
+
+        fn read_captured_bits(&mut self) -> Result<BitVec<u8, Lsb0>, DebugProbeError> {
+            Ok(BitVec::new())
+        }
+    }
+
+    /// The pre-batching navigation: one shift_bit per step.
+    fn reference_move(io: &mut Recorder, target: JtagState) {
+        while let Some(tms) = io.driver.state.step_toward(target) {
+            io.shift_bit(tms, false, false).unwrap();
+        }
+    }
+
+    #[test]
+    fn batched_navigation_matches_per_bit_reference() {
+        let states = [
+            JtagState::Reset,
+            JtagState::Idle,
+            JtagState::Dr(RegisterState::Select),
+            JtagState::Dr(RegisterState::Capture),
+            JtagState::Dr(RegisterState::Shift),
+            JtagState::Dr(RegisterState::Update),
+            JtagState::Ir(RegisterState::Select),
+            JtagState::Ir(RegisterState::Shift),
+            JtagState::Ir(RegisterState::Update),
+        ];
+        for start in states {
+            for target in states {
+                let mut reference = Recorder::new(start);
+                reference_move(&mut reference, target);
+                let mut batched = Recorder::new(start);
+                jtag_move_to_state(&mut batched, target).unwrap();
+                assert_eq!(
+                    reference.clocks, batched.clocks,
+                    "clock stream differs for {start:?}->{target:?}"
+                );
+                assert_eq!(
+                    reference.driver.state, batched.driver.state,
+                    "tracked state differs for {start:?}->{target:?}"
+                );
+            }
         }
     }
 }
