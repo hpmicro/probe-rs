@@ -453,8 +453,12 @@ impl<'session> Flasher<'session> {
         // flash driver, which loops the pages internally - one large
         // call per batch replaces the per-page call cycle that
         // dominates the programming time. The buffers live in the
-        // data region as one contiguous strip sized for a batch.
-        const BATCH_PAGES: usize = 16;
+        // data region as one contiguous strip sized for a batch; the
+        // batch size follows the scratch space the algorithm's layout
+        // actually provides, so a target whose data region holds
+        // barely two page buffers programs one-page batches instead of
+        // writing past the end of RAM.
+        let page_size = self.flash_algorithm.flash_properties.page_size as u64;
 
         self.progress
             .started_programming(flash_encoder.program_size());
@@ -473,36 +477,53 @@ impl<'session> Flasher<'session> {
             let mut run_start = 0usize;
             for i in 1..=all_pages.len() {
                 let run_break = i == all_pages.len()
-                    || all_pages[i].address() != all_pages[i - 1].address() + 256;
+                    || all_pages[i].address() != all_pages[i - 1].address() + page_size;
                 if run_break {
                     runs.push(&all_pages[run_start..i]);
                     run_start = i;
                 }
             }
 
-            for chunk in runs.into_iter().flat_map(|r| r.chunks(BATCH_PAGES)) {
-                let t_d = Instant::now();
-                let mut block = Vec::with_capacity(chunk.len() * 256);
-                for page in chunk {
-                    block.extend_from_slice(page.data());
-                }
+            // Two strips of half the scratch space each: while the
+            // routine programs from one strip, the next batch's data is
+            // transported into the other - the transport overlaps the
+            // physical write. The system bus reaches the data memory
+            // independently of the hart, so the writes race the routine
+            // instead of waiting for it.
+            let strip_base = active.buffer_address(0);
+            let scratch = active.flash_algorithm.data_end.saturating_sub(strip_base);
+            // The tuned ceiling keeps the transport/program overlap at
+            // the granularity the timing was optimized for; the scratch
+            // bound is what keeps small regions safe.
+            let batch_pages = (((scratch / 2) / page_size) as usize).clamp(1, 16);
+            let strips = [strip_base, strip_base + (batch_pages as u64) * page_size];
+
+            let batches: Vec<&[FlashPage]> = runs
+                .into_iter()
+                .flat_map(|r| r.chunks(batch_pages))
+                .collect();
+
+            // Prefetch the first batch.
+            let mut next_block = Vec::new();
+            for page in batches[0] {
+                next_block.extend_from_slice(page.data());
+            }
+            active.load_data(strips[0], &next_block)?;
+
+            for (i, chunk) in batches.iter().enumerate() {
                 let batch_address = chunk[0].address();
-                let batch_len = block.len();
+                let batch_len = next_block.len();
+                let strip = strips[i % 2];
 
-                active.load_data(active.buffer_address(0), &block)?;
-                let d_us = t_d.elapsed().as_micros();
+                active.program_block(batch_address, batch_len, strip)?;
 
-                let t_s = Instant::now();
-                active.program_block(batch_address, batch_len)?;
-                let s_us = t_s.elapsed().as_micros();
-
-                let t_w = Instant::now();
+                let t_d = Instant::now();
                 // A freshly resumed core can still report its previous
                 // halted state for a moment; waiting for "halted" before
                 // it actually ran would report a fake completion while
                 // the routine is still consuming the buffer. Confirm the
-                // core left the halted state first, then wait for the
-                // real halt.
+                // core left the halted state first; while the routine
+                // runs, transport the next batch into the other strip.
                 let leave = Instant::now();
                 loop {
                     let halted = matches!(
@@ -519,19 +540,22 @@ impl<'session> Flasher<'session> {
                         });
                     }
                 }
+
+                next_block.clear();
+                if let Some(next) = batches.get(i + 1) {
+                    for page in *next {
+                        next_block.extend_from_slice(page.data());
+                    }
+                    active.load_data(strips[(i + 1) % 2], &next_block)?;
+                }
+                let _ = t_d;
+
                 let result = active
                     .wait_for_completion(Duration::from_secs(10))
                     .map_err(|error| FlashError::PageWrite {
                         page_address: batch_address,
                         source: Box::new(error),
                     })?;
-                let w_us = t_w.elapsed().as_micros();
-
-                batch_no += 1;
-                eprintln!(
-                    "BATCH n={batch_no} pages={} D={d_us}us S={s_us}us W={w_us}us",
-                    chunk.len()
-                );
 
                 active.progress.page_programmed(batch_len as u32, t.elapsed());
                 t = Instant::now();
@@ -1150,9 +1174,8 @@ impl<'p> ActiveFlasher<'p, Program> {
         &mut self,
         address: u64,
         length: usize,
+        buffer_address: u64,
     ) -> Result<(), FlashError> {
-        let buffer_address = self.buffer_address(0);
-
         self.call_function(
             &Registers {
                 pc: into_reg(self.flash_algorithm.pc_program_page)?,
