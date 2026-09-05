@@ -125,8 +125,17 @@ impl<'a> RuntimeTarget<'a> {
                         self.load_target_desc()?;
                     }
 
-                    // Start the GDB Stub state machine
-                    let stub = GdbStub::<RuntimeTarget, _>::new(s);
+                    // Start the GDB Stub state machine. A large packet
+                    // buffer lets GDB send bulk memory writes (the `load`
+                    // X packets) in few large transfers instead of one
+                    // round trip per few kilobytes.
+                    let stub = match GdbStub::<RuntimeTarget, _>::builder(s)
+                        .packet_buffer_size(64 * 1024)
+                        .build()
+                    {
+                        Ok(stub) => stub,
+                        Err(e) => return Err(anyhow::Error::from(e).into()),
+                    };
                     match stub.run_state_machine(self) {
                         Ok(gdbstub) => {
                             self.gdb = Some(gdbstub);
