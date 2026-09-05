@@ -1511,14 +1511,6 @@ impl<'state> RiscvCommunicationInterface<'state> {
         self.dtm.schedule_read(address)
     }
 
-    fn schedule_read_large_dtm_register<V, R>(&mut self) -> Result<DeferredResultIndex, RiscvError>
-    where
-        V: RiscvValue,
-        R: LargeRegister,
-    {
-        V::schedule_read_from_register::<R>(self)
-    }
-
     fn read_large_dtm_register<V, R>(&mut self) -> Result<V, RiscvError>
     where
         V: RiscvValue,
@@ -1713,12 +1705,6 @@ impl RiscvValue32 for u32 {
 pub(crate) trait RiscvValue: std::fmt::Debug + Copy + Sized {
     const WIDTH: RiscvBusAccess;
 
-    fn schedule_read_from_register<R>(
-        interface: &mut RiscvCommunicationInterface,
-    ) -> Result<DeferredResultIndex, RiscvError>
-    where
-        R: LargeRegister;
-
     fn schedule_write_to_register<R>(
         interface: &mut RiscvCommunicationInterface,
         value: Self,
@@ -1735,15 +1721,6 @@ pub(crate) trait RiscvValue: std::fmt::Debug + Copy + Sized {
 
 impl RiscvValue for u8 {
     const WIDTH: RiscvBusAccess = RiscvBusAccess::A8;
-
-    fn schedule_read_from_register<R>(
-        interface: &mut RiscvCommunicationInterface,
-    ) -> Result<DeferredResultIndex, RiscvError>
-    where
-        R: LargeRegister,
-    {
-        interface.schedule_read_dm_register_untyped(R::R0_ADDRESS as u64)
-    }
 
     fn schedule_write_to_register<R>(
         interface: &mut RiscvCommunicationInterface,
@@ -1770,15 +1747,6 @@ impl RiscvValue for u8 {
 impl RiscvValue for u16 {
     const WIDTH: RiscvBusAccess = RiscvBusAccess::A16;
 
-    fn schedule_read_from_register<R>(
-        interface: &mut RiscvCommunicationInterface,
-    ) -> Result<DeferredResultIndex, RiscvError>
-    where
-        R: LargeRegister,
-    {
-        interface.schedule_read_dm_register_untyped(R::R0_ADDRESS as u64)
-    }
-
     fn schedule_write_to_register<R>(
         interface: &mut RiscvCommunicationInterface,
         value: Self,
@@ -1804,14 +1772,6 @@ impl RiscvValue for u16 {
 impl RiscvValue for u32 {
     const WIDTH: RiscvBusAccess = RiscvBusAccess::A32;
 
-    fn schedule_read_from_register<R>(
-        interface: &mut RiscvCommunicationInterface,
-    ) -> Result<DeferredResultIndex, RiscvError>
-    where
-        R: LargeRegister,
-    {
-        interface.schedule_read_dm_register_untyped(R::R0_ADDRESS as u64)
-    }
     fn schedule_write_to_register<R>(
         interface: &mut RiscvCommunicationInterface,
         value: Self,
@@ -1836,16 +1796,6 @@ impl RiscvValue for u32 {
 
 impl RiscvValue for u64 {
     const WIDTH: RiscvBusAccess = RiscvBusAccess::A64;
-
-    fn schedule_read_from_register<R>(
-        interface: &mut RiscvCommunicationInterface,
-    ) -> Result<DeferredResultIndex, RiscvError>
-    where
-        R: LargeRegister,
-    {
-        interface.schedule_read_dm_register_untyped(R::R1_ADDRESS as u64)?;
-        interface.schedule_read_dm_register_untyped(R::R0_ADDRESS as u64)
-    }
 
     fn schedule_write_to_register<R>(
         interface: &mut RiscvCommunicationInterface,
@@ -1877,18 +1827,6 @@ impl RiscvValue for u64 {
 
 impl RiscvValue for u128 {
     const WIDTH: RiscvBusAccess = RiscvBusAccess::A128;
-
-    fn schedule_read_from_register<R>(
-        interface: &mut RiscvCommunicationInterface,
-    ) -> Result<DeferredResultIndex, RiscvError>
-    where
-        R: LargeRegister,
-    {
-        interface.schedule_read_dm_register_untyped(R::R3_ADDRESS as u64)?;
-        interface.schedule_read_dm_register_untyped(R::R2_ADDRESS as u64)?;
-        interface.schedule_read_dm_register_untyped(R::R1_ADDRESS as u64)?;
-        interface.schedule_read_dm_register_untyped(R::R0_ADDRESS as u64)
-    }
 
     fn schedule_write_to_register<R>(
         interface: &mut RiscvCommunicationInterface,
