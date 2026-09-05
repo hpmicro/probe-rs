@@ -214,6 +214,8 @@ impl<'session> Flasher<'session> {
             memory_map,
             progress: self.progress.clone(),
             flash_algorithm: self.flash_algorithm.clone(),
+            sw_breakpoint_trap_set: false,
+            cached_regs: [None; 8],
             _operation: core::marker::PhantomData,
         };
 
@@ -474,7 +476,9 @@ impl<'session> Flasher<'session> {
                 }
 
                 // Start the next copy process.
+                let t_s = Instant::now();
                 active.start_program_page_with_buffer(page.address(), current_buf)?;
+                eprintln!("SSEG S={}us", t_s.elapsed().as_micros());
 
                 // Swap the buffers
                 if current_buf == 1 {
@@ -558,6 +562,16 @@ pub(super) struct ActiveFlasher<'probe, O: Operation> {
     memory_map: Vec<MemoryRegion>,
     progress: FlashProgress,
     flash_algorithm: FlashAlgorithm,
+    /// Whether the core's dcsr has already been set to trap on ebreak.
+    /// The bit survives halt/resume, so it only needs to be written
+    /// once per flasher; re-writing it costs a CSR read-and-write
+    /// cycle on every algorithm call.
+    sw_breakpoint_trap_set: bool,
+    /// Values of the callee-saved registers (static base, stack
+    /// pointer) as left by the previous algorithm call: the algorithm
+    /// preserves them, so an unchanged value does not need to be
+    /// written again.
+    cached_regs: [Option<u32>; 8],
     _operation: core::marker::PhantomData<O>,
 }
 
@@ -678,12 +692,27 @@ impl<'probe, O: Operation> ActiveFlasher<'probe, O> {
             ),
         ];
 
-        for (description, value) in registers {
+        for (slot, (description, value)) in registers.iter().enumerate() {
             if let Some(v) = value {
-                self.core.write_core_reg(description, v)?;
+                let v = *v;
+                // The callee-saved registers (static base and stack
+                // pointer) keep their values across an algorithm call,
+                // so re-writing them when the previous call already set
+                // the same value is redundant. Every other register -
+                // pc, the arguments, and the scratch registers - is
+                // clobbered by the algorithm run and must always be
+                // written.
+                let cacheable = matches!(slot, 5 | 6);
+                if cacheable && self.cached_regs[slot] == Some(v) {
+                    continue;
+                }
+                if cacheable {
+                    self.cached_regs[slot] = Some(v);
+                }
+                self.core.write_core_reg(*description, v)?;
 
                 if tracing::enabled!(Level::DEBUG) {
-                    let value: u32 = self.core.read_core_reg(description)?;
+                    let value: u32 = self.core.read_core_reg(*description)?;
 
                     tracing::debug!(
                         "content of {} {:#x}: {:#010x} should be: {:#010x}",
@@ -697,8 +726,13 @@ impl<'probe, O: Operation> ActiveFlasher<'probe, O> {
         }
 
         // Ensure RISC-V `ebreak` instructions enter debug mode,
-        // this is necessary for soft breakpoints to work.
-        self.core.debug_on_sw_breakpoint(true)?;
+        // this is necessary for soft breakpoints to work. The dcsr bit
+        // survives halt/resume and nothing in the flasher lifetime
+        // resets it, so writing it once is enough.
+        if !self.sw_breakpoint_trap_set {
+            self.core.debug_on_sw_breakpoint(true)?;
+            self.sw_breakpoint_trap_set = true;
+        }
 
         // Resume target operation.
         self.core.run()?;
