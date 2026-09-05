@@ -66,6 +66,9 @@ pub(crate) struct RuntimeTarget<'a> {
     listener: TcpListener,
     /// The current GDB stub state machine
     gdb: Option<GdbStubStateMachine<'a, RuntimeTarget<'a>, TcpStream>>,
+    /// Bytes read from the connection but not yet fed to the stub state
+    /// machine (bulk-read ahead of per-byte processing).
+    rx_buf: std::collections::VecDeque<u8>,
     /// Resume action to be used upon a continue request
     resume_action: (usize, ResumeAction),
 
@@ -91,6 +94,7 @@ impl<'a> RuntimeTarget<'a> {
             flash_high_water: None,
             listener,
             gdb: None,
+            rx_buf: std::collections::VecDeque::new(),
             resume_action: (0, ResumeAction::Unchanged),
             target_desc: TargetDescription::default(),
         })
@@ -164,18 +168,35 @@ impl<'a> RuntimeTarget<'a> {
 
             self.gdb = match gdb {
                 GdbStubStateMachine::Idle(mut state) => {
-                    // Read data if available
-                    let next_byte = {
-                        let conn = state.borrow_conn();
+                    // Bulk-read new data into the local buffer, then feed
+                    // the state machine byte by byte from it: one socket
+                    // read per chunk instead of one per byte, which is
+                    // what large packets (GDB load writes) would
+                    // otherwise pay tens of thousands of syscalls for.
+                    if self.rx_buf.is_empty() {
+                        let mut chunk = [0u8; 16384];
+                        let n = read_chunk_if_available(state.borrow_conn(), &mut chunk)?;
+                        self.rx_buf.extend(&chunk[..n]);
+                    }
 
-                        read_if_available(conn)?
-                    };
-
-                    if let Some(b) = next_byte {
-                        Some(state.incoming_data(self, b).into_error()?)
-                    } else {
-                        wait_time = Duration::from_millis(10);
+                    if self.rx_buf.is_empty() {
+                        // Short wait: every round trip to GDB (an OK for a
+                        // write packet) pays half this on average, and a
+                        // load is a burst of such round trips.
+                        wait_time = Duration::from_millis(2);
                         Some(state.into())
+                    } else {
+                        let mut current = GdbStubStateMachine::Idle(state);
+                        while matches!(current, GdbStubStateMachine::Idle(_))
+                            && !self.rx_buf.is_empty()
+                        {
+                            let b = self.rx_buf.pop_front().unwrap();
+                            let GdbStubStateMachine::Idle(s) = current else {
+                                unreachable!("matches! guarded above");
+                            };
+                            current = s.incoming_data(self, b).into_error()?;
+                        }
+                        Some(current)
                     }
                 }
                 GdbStubStateMachine::Running(mut state) => {
@@ -316,6 +337,27 @@ fn read_if_available(conn: &mut TcpStream) -> Result<Option<u8>, Error> {
                 None => Ok(None),
             }
         }
+        Err(e) => Err(anyhow::Error::from(e).into()),
+    }
+}
+
+/// Read whatever the socket has buffered into `buf` without blocking.
+/// Returns 0 when nothing is pending yet. One read per chunk instead of
+/// per byte is what keeps large packets (GDB load writes) from paying
+/// thousands of syscalls each.
+///
+/// A zero-byte read is the peer closing the connection: surfaced as an
+/// error, not as "nothing pending", so the state machine tears the dead
+/// connection down and the listener can accept a new one.
+fn read_chunk_if_available(conn: &mut TcpStream, buf: &mut [u8]) -> Result<usize, Error> {
+    match std::io::Read::read(conn, buf) {
+        Ok(0) => Err(anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "GDB client closed the connection",
+        ))
+        .into()),
+        Ok(n) => Ok(n),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
         Err(e) => Err(anyhow::Error::from(e).into()),
     }
 }
