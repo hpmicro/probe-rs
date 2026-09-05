@@ -1,7 +1,9 @@
 use super::{ResumeAction, RuntimeTarget};
 
-use gdbstub::target::ext::base::multithread::MultiThreadSingleStepOps;
-use gdbstub::target::ext::base::multithread::{MultiThreadResume, MultiThreadSingleStep};
+use gdbstub::target::ext::base::multithread::{
+    MultiThreadResume, MultiThreadSchedulerLocking, MultiThreadSchedulerLockingOps,
+    MultiThreadSingleStep, MultiThreadSingleStepOps,
+};
 
 impl MultiThreadResume for RuntimeTarget<'_> {
     fn resume(&mut self) -> Result<(), Self::Error> {
@@ -41,6 +43,10 @@ impl MultiThreadResume for RuntimeTarget<'_> {
         Ok(())
     }
 
+    fn support_scheduler_locking(&mut self) -> Option<MultiThreadSchedulerLockingOps<'_, Self>> {
+        Some(self)
+    }
+
     fn support_single_step(&mut self) -> Option<MultiThreadSingleStepOps<'_, Self>> {
         Some(self)
     }
@@ -55,6 +61,19 @@ impl MultiThreadSingleStep for RuntimeTarget<'_> {
         let core_id = tid.get() - 1;
         self.resume_action = (core_id, ResumeAction::Step);
 
+        Ok(())
+    }
+}
+
+/// The stub groups all same-architecture cores into one target and its
+/// resume path runs every core, so a locked "other thread" cannot be
+/// held back. gdbstub 0.7.9 requires this IDET to answer GDB's
+/// scheduler-locking request at all (stepping would otherwise tear down
+/// the connection), hence the accept-and-ignore implementation; the
+/// semantics of `set scheduler-locking on` are not honored on
+/// multi-core targets.
+impl MultiThreadSchedulerLocking for RuntimeTarget<'_> {
+    fn set_resume_action_scheduler_lock(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
 }
