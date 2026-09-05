@@ -443,6 +443,118 @@ impl<'session> Flasher<'session> {
     /// This is only possible if the RAM is large enough to
     /// fit at least two page buffers. See [Flasher::double_buffering_supported].
     fn program_double_buffer(&mut self, flash_encoder: &FlashEncoder) -> Result<(), FlashError> {
+        // The routine's program entry passes its length straight to the
+        // flash driver, which loops the pages internally - one large
+        // call per batch replaces the per-page call cycle that
+        // dominates the programming time. The buffers live in the
+        // data region as one contiguous strip sized for a batch.
+        const BATCH_PAGES: usize = 16;
+
+        self.progress
+            .started_programming(flash_encoder.program_size());
+
+        let mut t = Instant::now();
+        let result = self.run_program(|active| {
+            let all_pages: Vec<_> = flash_encoder.pages().to_vec();
+            let mut batch_no = 0usize;
+
+            // Split the page list into runs of consecutive addresses: a
+            // single program call writes one contiguous block, so a gap
+            // in the image (unwritten bytes between sections) must end
+            // the run - writing across it would shift the following
+            // data into the gap.
+            let mut runs: Vec<&[FlashPage]> = Vec::new();
+            let mut run_start = 0usize;
+            for i in 1..=all_pages.len() {
+                let run_break = i == all_pages.len()
+                    || all_pages[i].address() != all_pages[i - 1].address() + 256;
+                if run_break {
+                    runs.push(&all_pages[run_start..i]);
+                    run_start = i;
+                }
+            }
+
+            for chunk in runs.into_iter().flat_map(|r| r.chunks(BATCH_PAGES)) {
+                let t_d = Instant::now();
+                let mut block = Vec::with_capacity(chunk.len() * 256);
+                for page in chunk {
+                    block.extend_from_slice(page.data());
+                }
+                let batch_address = chunk[0].address();
+                let batch_len = block.len();
+
+                active.load_data(active.buffer_address(0), &block)?;
+                let d_us = t_d.elapsed().as_micros();
+
+                let t_s = Instant::now();
+                active.program_block(batch_address, batch_len)?;
+                let s_us = t_s.elapsed().as_micros();
+
+                let t_w = Instant::now();
+                // A freshly resumed core can still report its previous
+                // halted state for a moment; waiting for "halted" before
+                // it actually ran would report a fake completion while
+                // the routine is still consuming the buffer. Confirm the
+                // core left the halted state first, then wait for the
+                // real halt.
+                let leave = Instant::now();
+                loop {
+                    let halted = matches!(
+                        active.core.status().map_err(FlashError::Core)?,
+                        crate::CoreStatus::Halted(_)
+                    );
+                    if !halted {
+                        break;
+                    }
+                    if leave.elapsed() > Duration::from_millis(100) {
+                        return Err(FlashError::RoutineCallFailed {
+                            name: "program_block",
+                            error_code: 0,
+                        });
+                    }
+                }
+                let result = active
+                    .wait_for_completion(Duration::from_secs(10))
+                    .map_err(|error| FlashError::PageWrite {
+                        page_address: batch_address,
+                        source: Box::new(error),
+                    })?;
+                let w_us = t_w.elapsed().as_micros();
+
+                batch_no += 1;
+                eprintln!(
+                    "BATCH n={batch_no} pages={} D={d_us}us S={s_us}us W={w_us}us",
+                    chunk.len()
+                );
+
+                active.progress.page_programmed(batch_len as u32, t.elapsed());
+                t = Instant::now();
+                if result != 0 {
+                    return Err(FlashError::RoutineCallFailed {
+                        name: "program_block",
+                        error_code: result,
+                    });
+                }
+            }
+
+            Ok(0)
+        });
+
+        if result.is_ok() {
+            self.progress.finished_programming();
+        } else {
+            self.progress.failed_programming();
+
+            result?;
+        }
+
+        Ok(())
+    }
+
+    fn program_double_buffer_per_page(
+        &mut self,
+        flash_encoder: &FlashEncoder,
+    ) -> Result<(), FlashError> {
         let mut current_buf = 0;
         self.progress
             .started_programming(flash_encoder.program_size());
@@ -1023,6 +1135,28 @@ impl<'p> ActiveFlasher<'p, Program> {
         })?;
 
         Ok(())
+    }
+
+    /// Program a contiguous block of arbitrary length with one routine
+    /// call. The routine's program entry passes the length through to
+    /// the flash driver, which loops the pages internally.
+    pub(super) fn program_block(
+        &mut self,
+        address: u64,
+        length: usize,
+    ) -> Result<(), FlashError> {
+        let buffer_address = self.buffer_address(0);
+
+        self.call_function(
+            &Registers {
+                pc: into_reg(self.flash_algorithm.pc_program_page)?,
+                r0: Some(into_reg(address)?),
+                r1: Some(length as u32),
+                r2: Some(into_reg(buffer_address)?),
+                r3: None,
+            },
+            false,
+        )
     }
 
     pub(super) fn load_page_buffer(
