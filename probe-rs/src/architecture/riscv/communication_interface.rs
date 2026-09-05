@@ -842,6 +842,10 @@ impl<'state> RiscvCommunicationInterface<'state> {
         address: u32,
         data: &mut [V],
     ) -> Result<(), RiscvError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
         let mut sbcs = Sbcs(0);
 
         sbcs.set_sbaccess(V::WIDTH as u32);
