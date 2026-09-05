@@ -56,6 +56,8 @@ pub(super) struct Flasher<'session> {
     core_index: usize,
     flash_algorithm: FlashAlgorithm,
     progress: FlashProgress,
+    /// Whether the algorithm has been written to the target's RAM yet.
+    algorithm_loaded: bool,
 }
 
 impl<'session> Flasher<'session> {
@@ -120,16 +122,16 @@ impl<'session> Flasher<'session> {
             target,
         )?;
 
-        let mut this = Self {
+        // The algorithm is loaded lazily on first active use: a flasher
+        // built only to answer layout questions never touches the
+        // target, so it must not pay the halt/reset/load cycle.
+        Ok(Self {
             session,
             core_index,
             flash_algorithm,
             progress,
-        };
-
-        this.load()?;
-
-        Ok(this)
+            algorithm_loaded: false,
+        })
     }
 
     pub(super) fn flash_algorithm(&self) -> &FlashAlgorithm {
@@ -200,6 +202,11 @@ impl<'session> Flasher<'session> {
         &mut self,
         clock: Option<u32>,
     ) -> Result<ActiveFlasher<'_, O>, FlashError> {
+        tracing::debug!("Preparing Flasher for operation {}", O::operation_name());
+        if !self.algorithm_loaded {
+            self.load()?;
+            self.algorithm_loaded = true;
+        }
         let memory_map = self.session.target().memory_map.clone();
         // Attach to memory and core.
         let core = self
@@ -207,7 +214,6 @@ impl<'session> Flasher<'session> {
             .core(self.core_index)
             .map_err(FlashError::Core)?;
 
-        tracing::debug!("Preparing Flasher for operation {}", O::operation_name());
         let mut flasher = ActiveFlasher::<O> {
             core,
             rtt: None,
