@@ -114,8 +114,40 @@ impl MultiThreadBase for RuntimeTarget<'_> {
         let mut session = self.session.lock();
         let mut core = session.core(tid.get() - 1).into_target_result()?;
 
-        core.write_8(start_addr, data)
-            .into_target_result_non_fatal()
+        // Byte-granular bus writes cost one DMI transaction per byte.
+        // GDB's bulk writes (X packets) are word-aligned for all but the
+        // section edges, so route the aligned middle through 32-bit
+        // writes and only the head/tail bytes individually.
+        let head_len = if start_addr & 3 == 0 {
+            0
+        } else {
+            (4 - (start_addr & 3) as usize).min(data.len())
+        };
+        if head_len > 0 {
+            core.write_8(start_addr, &data[..head_len])
+                .into_target_result_non_fatal()?;
+        }
+
+        let body = &data[head_len..];
+        let body_addr = start_addr + head_len as u64;
+        let tail_len = body.len() & 3;
+        let mid_len = body.len() - tail_len;
+
+        if mid_len > 0 {
+            let mut words = vec![0u32; mid_len / 4];
+            for (chunk, word) in body.chunks_exact(4).zip(words.iter_mut()) {
+                *word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+            core.write_32(body_addr, &words)
+                .into_target_result_non_fatal()?;
+        }
+
+        if tail_len > 0 {
+            core.write_8(body_addr + mid_len as u64, &body[mid_len..])
+                .into_target_result_non_fatal()?;
+        }
+
+        Ok(())
     }
 
     fn list_active_threads(
