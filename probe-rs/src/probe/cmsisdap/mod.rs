@@ -2,6 +2,8 @@
 mod commands;
 mod tools;
 
+use anyhow::anyhow;
+
 use crate::{
     architecture::{
         arm::{
@@ -1290,26 +1292,14 @@ impl RawJtagIo for CmsisDap {
         Ok(())
     }
     fn read_captured_bits(&mut self) -> Result<BitVec<u8, Lsb0>, DebugProbeError> {
-        let mut capture = BitVec::<u8, Lsb0>::new();
-        // We can transfer up to 255 sequences in one dap jtag-sequence command. But in some riscv chip there is some bug, thus I set up to 3 sequence in once jtag-sequence command transfer.
-        for sequence_slice in self.jtag_sequences.clone().chunks(50) {
-            let mut batch_sequence = Vec::new();
-            batch_sequence.extend_from_slice(sequence_slice);
-            let capture_count = batch_sequence.iter().map(|x| x.capture_count()).sum();
-            match self.send_jtag_sequences(JtagSequenceRequest::new(batch_sequence)?) {
-                Ok(x) => {
-                    let mut batch_capture = BitVec::<u8, Lsb0>::from_vec(x);
-                    batch_capture.truncate(capture_count);
-                    capture.extend_from_bitslice(batch_capture.as_bitslice());
-                }
-                Err(err) => {
-                    self.jtag_sequences.clear();
-                    return Err(err.into());
-                }
-            }
-        }
-        self.jtag_sequences.clear();
-        Ok(capture)
+        // The queue leaves the driver up front: whatever happens on the
+        // wire, no stale sequence survives into the next transfer.
+        let mut sequences = std::mem::take(&mut self.jtag_sequences);
+        let packet_size = self.packet_size;
+        read_captured_bits_with(&mut sequences, packet_size, |batch| {
+            let response = self.send_jtag_sequences(JtagSequenceRequest::new(batch.clone())?)?;
+            Ok(response)
+        })
     }
 }
 impl Drop for CmsisDap {
@@ -1328,11 +1318,306 @@ impl Drop for CmsisDap {
     }
 }
 
+/// Sequence cap per DAP_JTAG_SEQUENCE command. The protocol encodes the
+/// count in one byte (maximum 255); the packet byte budgets below are
+/// what actually bound bulk transfers, this cap only keeps any single
+/// command's response wait bounded.
+const JTAG_SEQUENCES_PER_COMMAND: usize = 50;
+
+/// Wire bytes every DAP_JTAG_SEQUENCE command spends before any sequence:
+/// the command id, the sequence count byte, and one byte of report
+/// framing.
+const JTAG_SEQUENCE_HEADER_BYTES: usize = 3;
+
+/// Response bytes spent before any captured TDO data: the status byte.
+/// (On HID v1 devices the response report adds its own framing byte,
+/// which the negotiated report size already accounts for.)
+const JTAG_SEQUENCE_RESPONSE_HEADER_BYTES: usize = 1;
+
+/// Split queued sequences into DAP_JTAG_SEQUENCE commands under three
+/// bounds: at most `max_per_command` sequences per command, each
+/// command's wire size within the device packet (every sequence costs
+/// its info byte plus its TDI payload padded to whole bytes, on top of
+/// the command header), and the command's captured TDO data within the
+/// response packet (every captured sequence answers with its bits
+/// padded to whole bytes, on top of the status byte). Capture-dense
+/// batches overflow the response side long before the request side -
+/// a command full of 41-bit captures spends ~7 request bytes but ~6
+/// response bytes per sequence - and an overflowed response silently
+/// truncates the capture stream, so both budgets bind. A single
+/// sequence too large for a whole packet is an error rather than a
+/// split point.
+fn plan_sequence_commands(
+    sequences: &[JtagSequence],
+    packet_size: u16,
+    max_per_command: usize,
+) -> Result<Vec<Vec<JtagSequence>>, DebugProbeError> {
+    let byte_budget = packet_size as usize - JTAG_SEQUENCE_HEADER_BYTES;
+    let response_budget = packet_size as usize - JTAG_SEQUENCE_RESPONSE_HEADER_BYTES;
+    let mut batches: Vec<Vec<JtagSequence>> = Vec::new();
+    let mut batch: Vec<JtagSequence> = Vec::new();
+    let mut sequences_left = max_per_command;
+    let mut bytes_left = byte_budget;
+    let mut response_bytes_left = response_budget;
+
+    for sequence in sequences {
+        let cost = sequence.wire_bytes();
+        let response_cost = sequence
+            .captured_bits()
+            .map(|bits| bits.div_ceil(8))
+            .unwrap_or(0);
+        if cost > byte_budget || response_cost > response_budget {
+            return Err(DebugProbeError::Other(anyhow!(
+                "a single JTAG sequence costs {cost} wire bytes / \
+                 {response_cost} response bytes and cannot fit the \
+                 {byte_budget}-byte command / {response_budget}-byte \
+                 response budgets"
+            )));
+        }
+        if !batch.is_empty()
+            && (sequences_left == 0
+                || bytes_left < cost
+                || response_bytes_left < response_cost)
+        {
+            batches.push(std::mem::take(&mut batch));
+            sequences_left = max_per_command;
+            bytes_left = byte_budget;
+            response_bytes_left = response_budget;
+        }
+        sequences_left -= 1;
+        bytes_left -= cost;
+        response_bytes_left -= response_cost;
+        batch.push(*sequence);
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    Ok(batches)
+}
+
+/// Extract the captured TDO bits from one command's response. The DAP
+/// pads every captured sequence to a whole number of bytes (e.g. 41 TDO
+/// bits arrive as 48); keep each sequence's captured bits and skip its
+/// padding, so concatenated captures stay aligned - concatenating the
+/// raw bytes and truncating the total would keep interior padding and
+/// misalign every capture after the first.
+fn slice_sequence_captures(
+    batch: &[JtagSequence],
+    response_bytes: &[u8],
+) -> Result<BitVec<u8, Lsb0>, DebugProbeError> {
+    let mut stream = BitVec::<u8, Lsb0>::from_vec(response_bytes.to_vec());
+    let mut capture = BitVec::<u8, Lsb0>::new();
+
+    for sequence in batch {
+        let padded = sequence.captured_bits_padded();
+        if padded == 0 {
+            continue;
+        }
+        let captured = sequence.captured_bits().expect("padded implies captured");
+        if stream.len() < padded {
+            return Err(DebugProbeError::Other(anyhow!(
+                "short JTAG sequence response: need {padded} bits, have {}",
+                stream.len()
+            )));
+        }
+        capture.extend_from_bitslice(&stream[..captured]);
+        stream = stream[padded..].to_bitvec();
+    }
+    Ok(capture)
+}
+
+/// Flush queued sequences through an injected transport and collect the
+/// captured TDO bits. The queue is consumed up front - whatever happens
+/// on the wire, no stale sequence survives into the next transfer - and
+/// the transport is a parameter so the planning, slicing, and
+/// queue-clearing contracts are testable without hardware.
+fn read_captured_bits_with(
+    queue: &mut Vec<JtagSequence>,
+    packet_size: u16,
+    mut send: impl FnMut(Vec<JtagSequence>) -> Result<Vec<u8>, DebugProbeError>,
+) -> Result<BitVec<u8, Lsb0>, DebugProbeError> {
+    let sequences = std::mem::take(queue);
+    let mut capture = BitVec::<u8, Lsb0>::new();
+    for batch in plan_sequence_commands(&sequences, packet_size, JTAG_SEQUENCES_PER_COMMAND)? {
+        let response_bytes = send(batch.clone())?;
+        capture.extend_from_bitslice(&slice_sequence_captures(&batch, &response_bytes)?);
+    }
+    Ok(capture)
+}
+
 impl From<ScanChainError> for CmsisDapError {
     fn from(error: ScanChainError) -> Self {
         match error {
             ScanChainError::InvalidIdCode => CmsisDapError::InvalidIdCode,
             ScanChainError::InvalidIR => CmsisDapError::InvalidIR,
         }
+    }
+}
+
+#[cfg(test)]
+mod sequence_capture_tests {
+    use super::*;
+
+    #[test]
+    fn plan_sequence_commands_splits_by_byte_budget() {
+        let scan = || JtagSequence::new(41, true, false, [0xFF; 8]).unwrap();
+        let bit = || JtagSequence::new(1, false, false, [1, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+
+        // A 41-cycle sequence costs 7 wire bytes; under a 61-byte budget
+        // (64-byte packet minus the header) eight of them fit (8*7=56)
+        // and the ninth would not (63).
+        let sequences: Vec<JtagSequence> = (0..12).map(|_| scan()).collect();
+        let batches = plan_sequence_commands(&sequences, 64, JTAG_SEQUENCES_PER_COMMAND).unwrap();
+        let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![8, 4]);
+
+        // Twenty one-bit sequences (2 bytes each) fit one command.
+        let sequences: Vec<JtagSequence> = (0..20).map(|_| bit()).collect();
+        let batches = plan_sequence_commands(&sequences, 64, JTAG_SEQUENCES_PER_COMMAND).unwrap();
+        assert_eq!(batches.len(), 1);
+
+        // Sixty one-bit sequences under a 61-byte budget split by the BYTE
+        // budget (30*2=60 fits, 31*2=62 does not), not by the count cap.
+        let sequences: Vec<JtagSequence> = (0..60).map(|_| bit()).collect();
+        let batches = plan_sequence_commands(&sequences, 64, JTAG_SEQUENCES_PER_COMMAND).unwrap();
+        let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![30, 30]);
+
+        // With byte room to spare (131-byte budget), the same sixty
+        // sequences split by the COUNT cap instead.
+        let batches = plan_sequence_commands(&sequences, 131, JTAG_SEQUENCES_PER_COMMAND).unwrap();
+        let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![50, 10]);
+
+        // Two hundred one-bit sequences under a 1021-byte budget also
+        // split by the COUNT cap.
+        let sequences: Vec<JtagSequence> = (0..200).map(|_| bit()).collect();
+        let batches = plan_sequence_commands(&sequences, 1024, JTAG_SEQUENCES_PER_COMMAND).unwrap();
+        let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![50, 50, 50, 50]);
+
+        // Capture-dense batches: every 41-bit capture sequence answers
+        // with 6 response bytes, so the response budget must bind too -
+        // and no emitted command may exceed either budget.
+        let scans: Vec<JtagSequence> = (0..200).map(|_| scan()).collect();
+        let batches = plan_sequence_commands(&scans, 512, JTAG_SEQUENCES_PER_COMMAND).unwrap();
+        assert!(batches.len() >= 3);
+        for batch in &batches {
+            let wire: usize = batch.iter().map(|s| s.wire_bytes()).sum();
+            let response: usize = batch
+                .iter()
+                .map(|s| s.captured_bits().map(|b| b.div_ceil(8)).unwrap_or(0))
+                .sum();
+            assert!(wire <= 512 - JTAG_SEQUENCE_HEADER_BYTES, "wire {wire}");
+            assert!(
+                response <= 512 - JTAG_SEQUENCE_RESPONSE_HEADER_BYTES,
+                "response {response}"
+            );
+        }
+
+        // Exact fill: with a 64-byte budget, the 32nd one-bit sequence
+        // (remaining 2 == cost) is admitted - an off-by-one split at
+        // equality would produce [31, 29].
+        let sequences: Vec<JtagSequence> = (0..60).map(|_| bit()).collect();
+        let batches = plan_sequence_commands(&sequences, 67, JTAG_SEQUENCES_PER_COMMAND).unwrap();
+        let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![32, 28]);
+    }
+
+    #[test]
+    fn single_sequence_over_budget_rejected() {
+        // A 64-cycle sequence costs 9 wire bytes; a packet leaving only 8
+        // cannot carry it even as a command of its own - that is an
+        // error, not a wrapping split.
+        let sequence = JtagSequence::new(64, true, false, [0xFF; 8]).unwrap();
+        let result = plan_sequence_commands(&[sequence], 11, JTAG_SEQUENCES_PER_COMMAND);
+        assert!(result.is_err());
+    }
+
+    fn padded_capture_stream(captured: &[bool], padding_bits: usize) -> Vec<u8> {
+        // Model the wire format: the captured bits followed by padding to
+        // a whole byte boundary, with the padding bits reading as ones.
+        let mut stream = BitVec::<u8, Lsb0>::new();
+        stream.extend(captured.iter().copied());
+        stream.extend(std::iter::repeat(true).take(padding_bits));
+        stream.into_vec()
+    }
+
+    #[test]
+    fn slice_sequence_captures_strips_interior_padding() {
+        let first: Vec<bool> = (0..41).map(|i| i % 3 == 0).collect();
+        let second: Vec<bool> = (0..41).map(|i| i % 2 == 0).collect();
+        let mut response = padded_capture_stream(&first, 7);
+        response.extend(padded_capture_stream(&second, 7));
+
+        let batch = vec![
+            JtagSequence::new(41, true, false, [0x00; 8]).unwrap(),
+            JtagSequence::new(41, true, false, [0x00; 8]).unwrap(),
+        ];
+        let capture = slice_sequence_captures(&batch, &response).unwrap();
+
+        // Exactly the 82 captured bits survive; the second capture starts
+        // at bit 41, not at the padded 48-bit boundary.
+        assert_eq!(capture.len(), 82);
+        let extracted: Vec<bool> = capture.iter().by_vals().collect();
+        assert_eq!(&extracted[..41], &first[..]);
+        assert_eq!(&extracted[41..], &second[..]);
+    }
+
+    #[test]
+    fn slice_sequence_captures_rejects_short_response() {
+        let batch = vec![JtagSequence::new(41, true, false, [0x00; 8]).unwrap()];
+        // Five bytes carry 40 bits, one short of the 48 the padded
+        // capture must occupy; truncating silently would misalign every
+        // later capture, so this must be an error.
+        let response = vec![0xFFu8; 5];
+        assert!(slice_sequence_captures(&batch, &response).is_err());
+    }
+
+    #[test]
+    fn read_captured_bits_clears_queue_on_send_error() {
+        // A failing transport must propagate the error AND leave no stale
+        // sequence behind: the queue is drained up front, so the next
+        // transfer starts from an empty bitstream.
+        let mut queue: Vec<JtagSequence> = (0..4)
+            .map(|_| JtagSequence::new(41, true, false, [0x00; 8]).unwrap())
+            .collect();
+        let result = read_captured_bits_with(&mut queue, 64, |_| {
+            Err(DebugProbeError::Other(anyhow!("usb write failed")))
+        });
+        assert!(result.is_err());
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn read_captured_bits_clears_queue_on_short_response() {
+        // A response too short for its padded capture fails the flush; the
+        // queue must still be empty afterwards.
+        let mut queue: Vec<JtagSequence> =
+            vec![JtagSequence::new(41, true, false, [0x00; 8]).unwrap()];
+        let result = read_captured_bits_with(&mut queue, 64, |_| Ok(vec![0xFF; 5]));
+        assert!(result.is_err());
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn read_captured_bits_slices_padding_end_to_end() {
+        // Two captured 41-bit scans queued as one command; the transport
+        // returns the wire-format response with interior padding, and the
+        // collected capture contains both scans back to back.
+        let first: Vec<bool> = (0..41).map(|i| i % 3 == 0).collect();
+        let second: Vec<bool> = (0..41).map(|i| i % 2 == 0).collect();
+        let mut response = padded_capture_stream(&first, 7);
+        response.extend(padded_capture_stream(&second, 7));
+
+        let mut queue: Vec<JtagSequence> = (0..2)
+            .map(|_| JtagSequence::new(41, true, false, [0x00; 8]).unwrap())
+            .collect();
+        let capture =
+            read_captured_bits_with(&mut queue, 64, move |_batch| Ok(response.clone())).unwrap();
+        assert_eq!(capture.len(), 82);
+        let extracted: Vec<bool> = capture.iter().by_vals().collect();
+        assert_eq!(&extracted[..41], &first[..]);
+        assert_eq!(&extracted[41..], &second[..]);
     }
 }
