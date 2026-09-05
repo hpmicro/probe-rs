@@ -88,9 +88,30 @@ impl<'state> Riscv32<'state> {
             0x40705013, // srai x0, x0, 7 (NOP encoding the semihosting call number 7)
         ];
 
-        // Read the actual instructions, starting at the instruction before the ebreak (PC-4)
-        let mut actual_instructions = [0u32; 3];
-        self.read_32((pc - 4) as u64, &mut actual_instructions)?;
+        // Read the actual instructions, starting at the instruction before
+        // the ebreak (PC-4). The PC only carries the instruction
+        // alignment (2 bytes with compressed instructions), so this read
+        // must go through the aligning byte-level reader: a raw word read
+        // at a misaligned address is a hard system bus error, and the
+        // error latches until cleared. A PC at the very base of a memory
+        // region (e.g. the reset entry at the start of flash) makes the
+        // PC-4 window itself unmapped - a failing read there simply means
+        // no semihosting sequence can precede this PC.
+        let mut instruction_bytes = [0u8; 12];
+        match self.read((pc - 4) as u64, &mut instruction_bytes) {
+            Ok(()) => {}
+            Err(e) => match e {
+                crate::Error::Riscv(RiscvError::SystemBusAccess) => return Ok(None),
+                other => return Err(other),
+            },
+        }
+        let actual_instructions: [u32; 3] = core::array::from_fn(|i| {
+            u32::from_le_bytes(
+                instruction_bytes[i * 4..(i + 1) * 4]
+                    .try_into()
+                    .expect("a 4-byte slice of a 12-byte buffer"),
+            )
+        });
         let actual_instructions = actual_instructions.as_slice();
 
         tracing::debug!(

@@ -591,6 +591,8 @@ impl<'state> RiscvCommunicationInterface<'state> {
         // the system bus access conforms to the debug
         // specification 13.2.
         if sbcs.sbversion() == 1 {
+            self.clear_system_bus_errors()?;
+
             // When possible, we use system bus access for memory access
 
             if sbcs.sbaccess8() {
@@ -727,6 +729,18 @@ impl<'state> RiscvCommunicationInterface<'state> {
             .read_with_timeout(address, Duration::from_millis(1000))
     }
 
+    /// Clear the sticky system-bus error bits. Both `sberror` and
+    /// `sbbusyerror` survive until written back with ones, and with
+    /// them set every further system bus access fails before it starts
+    /// - so errors are cleared both before first use and before they
+    /// are reported.
+    fn clear_system_bus_errors(&mut self) -> Result<(), RiscvError> {
+        let mut clear = Sbcs(0);
+        clear.set_sberror(0b111);
+        clear.set_sbbusyerror(true);
+        self.write_dm_register(clear)
+    }
+
     pub(crate) fn write_dm_register<R: MemoryMappedRegister<u32>>(
         &mut self,
         register: R,
@@ -828,6 +842,7 @@ impl<'state> RiscvCommunicationInterface<'state> {
         let sbcs = self.read_dm_register::<Sbcs>()?;
 
         if sbcs.sberror() != 0 {
+            self.clear_system_bus_errors()?;
             Err(RiscvError::SystemBusAccess)
         } else {
             Ok(data)
@@ -865,6 +880,17 @@ impl<'state> RiscvCommunicationInterface<'state> {
             data[i] = self.read_large_dtm_register::<V, Sbdata>()?;
         }
 
+        // Writing sbcs while the last pipelined read is still in flight
+        // is undefined behavior (the spec requires sbbusy to read 0
+        // first), and on this DM it latches a sticky sberror that
+        // blocks all further system bus accesses. Wait for the bus to
+        // settle before reconfiguring.
+        for _ in 0..1000 {
+            if !self.read_dm_register::<Sbcs>()?.sbbusy() {
+                break;
+            }
+        }
+
         sbcs.set_sbautoincrement(false);
         self.write_dm_register(sbcs)?;
 
@@ -875,6 +901,7 @@ impl<'state> RiscvCommunicationInterface<'state> {
 
         // Check that the read was succesful
         if sbcs.sberror() != 0 {
+            self.clear_system_bus_errors()?;
             Err(RiscvError::SystemBusAccess)
         } else {
             Ok(())
@@ -1037,6 +1064,7 @@ impl<'state> RiscvCommunicationInterface<'state> {
         let sbcs = self.read_dm_register::<Sbcs>()?;
 
         if sbcs.sberror() != 0 {
+            self.clear_system_bus_errors()?;
             Err(RiscvError::SystemBusAccess)
         } else {
             Ok(())
