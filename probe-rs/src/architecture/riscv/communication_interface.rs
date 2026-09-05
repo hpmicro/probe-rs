@@ -723,7 +723,8 @@ impl<'state> RiscvCommunicationInterface<'state> {
     ///
     /// Use the [`read_dm_register`] function if possible.
     fn read_dm_register_untyped(&mut self, address: u64) -> Result<u32, RiscvError> {
-        self.dtm.read_with_timeout(address, Duration::from_millis(1000))
+        self.dtm
+            .read_with_timeout(address, Duration::from_millis(1000))
     }
 
     pub(crate) fn write_dm_register<R: MemoryMappedRegister<u32>>(
@@ -856,7 +857,7 @@ impl<'state> RiscvCommunicationInterface<'state> {
 
         let data_len = data.len();
 
-        for i in 0..data_len - 1{
+        for i in 0..data_len - 1 {
             data[i] = self.read_large_dtm_register::<V, Sbdata>()?;
         }
 
@@ -864,7 +865,7 @@ impl<'state> RiscvCommunicationInterface<'state> {
         self.write_dm_register(sbcs)?;
 
         // Read last value
-        data[data_len-1] = self.read_large_dtm_register::<V, Sbdata>()?;
+        data[data_len - 1] = self.read_large_dtm_register::<V, Sbdata>()?;
 
         let sbcs = self.read_dm_register::<Sbcs>()?;
 
@@ -1619,9 +1620,9 @@ impl<'state> RiscvCommunicationInterface<'state> {
             if readback.allhavereset() && readback.allhalted() {
                 break;
             }
-            
+
             if start.elapsed() > timeout {
-                println!("reset_hart_and_halt");
+                tracing::debug!("reset_hart_and_halt: reset not acknowledged in time");
                 return Err(RiscvError::RequestNotAcknowledged);
             }
         }
@@ -1751,12 +1752,14 @@ impl RiscvValue for u8 {
     }
 
     fn read_from_register<R>(
-            interface: &mut RiscvCommunicationInterface,
-        ) -> Result<Self, RiscvError>
-        where
-            R: LargeRegister
+        interface: &mut RiscvCommunicationInterface,
+    ) -> Result<Self, RiscvError>
+    where
+        R: LargeRegister,
     {
-        interface.read_dm_register_untyped(R::R0_ADDRESS as u64).map(|x| x as u8)
+        interface
+            .read_dm_register_untyped(R::R0_ADDRESS as u64)
+            .map(|x| x as u8)
     }
 }
 
@@ -1786,9 +1789,11 @@ impl RiscvValue for u16 {
         interface: &mut RiscvCommunicationInterface,
     ) -> Result<Self, RiscvError>
     where
-        R: LargeRegister
+        R: LargeRegister,
     {
-        interface.read_dm_register_untyped(R::R0_ADDRESS as u64).map(|x| x as u16)
+        interface
+            .read_dm_register_untyped(R::R0_ADDRESS as u64)
+            .map(|x| x as u16)
     }
 }
 
@@ -1817,9 +1822,11 @@ impl RiscvValue for u32 {
         interface: &mut RiscvCommunicationInterface,
     ) -> Result<Self, RiscvError>
     where
-        R: LargeRegister
+        R: LargeRegister,
     {
-        interface.read_dm_register_untyped(R::R0_ADDRESS as u64).map(|x| x as u32)
+        interface
+            .read_dm_register_untyped(R::R0_ADDRESS as u64)
+            .map(|x| x as u32)
     }
 }
 
@@ -1856,11 +1863,11 @@ impl RiscvValue for u64 {
         interface: &mut RiscvCommunicationInterface,
     ) -> Result<Self, RiscvError>
     where
-        R: LargeRegister
+        R: LargeRegister,
     {
         let r1 = interface.read_dm_register_untyped(R::R1_ADDRESS as u64)? as u64;
         let r0 = interface.read_dm_register_untyped(R::R0_ADDRESS as u64)? as u64;
-        Ok((r1<<32)+r0)
+        Ok((r1 << 32) + r0)
     }
 }
 
@@ -1904,13 +1911,13 @@ impl RiscvValue for u128 {
         interface: &mut RiscvCommunicationInterface,
     ) -> Result<Self, RiscvError>
     where
-        R: LargeRegister
+        R: LargeRegister,
     {
         let r3 = interface.read_dm_register_untyped(R::R3_ADDRESS as u64)? as u128;
         let r2 = interface.read_dm_register_untyped(R::R2_ADDRESS as u64)? as u128;
         let r1 = interface.read_dm_register_untyped(R::R1_ADDRESS as u64)? as u128;
         let r0 = interface.read_dm_register_untyped(R::R0_ADDRESS as u64)? as u128;
-        Ok((r3<<96)+(r2<<64)+(r1<<32)+r0)
+        Ok((r3 << 96) + (r2 << 64) + (r1 << 32) + r0)
     }
 }
 
