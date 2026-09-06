@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::architecture::riscv::communication_interface::{
     RiscvCommunicationInterface, RiscvDebugInterfaceState, RiscvError, RiscvInterfaceBuilder,
 };
-use crate::probe::DebugProbeError;
+use crate::probe::{DebugProbeError, WireProtocol};
 use crate::probe::{
     CommandResult, DeferredResultIndex, DeferredResultSet, JTAGAccess, JtagCommandQueue,
     JtagWriteCommand,
@@ -197,12 +197,16 @@ impl DtmAccess for JtagDtm<'_> {
         }
 
         // Setup the number of idle cycles between JTAG accesses. The
-        // value the DTM reports is a conservative suggestion; the actual
-        // DMI timing requirement on this part is lower, and every idle
-        // cycle is wire time on each of the hundreds of transactions a
-        // bulk transfer pays.
-        const IDLE_CYCLES_CAP: u32 = 2;
-        let idle_cycles = idle_cycles.min(IDLE_CYCLES_CAP);
+        // value the DTM reports is a conservative suggestion, and on
+        // 4-pin JTAG the actual DMI timing requirement of this part is
+        // far lower - every idle cycle is wire time per transaction,
+        // hundreds of times over in a bulk transfer. cJTAG keeps the
+        // reported value: its TMS-clocked frames need the full recovery
+        // time (DMI busy errors appear at a lower cap).
+        let idle_cycles = match self.probe.active_protocol() {
+            Some(WireProtocol::CJtag) => idle_cycles,
+            _ => idle_cycles.min(2),
+        };
         self.probe.set_idle_cycles(idle_cycles as u8);
         self.state.abits = abits;
 
