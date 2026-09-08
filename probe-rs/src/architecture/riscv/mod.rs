@@ -37,6 +37,22 @@ pub struct Riscv32<'state> {
 }
 
 impl<'state> Riscv32<'state> {
+    /// Whether the instruction at the halted PC is physically an ebreak
+    /// or c.ebreak encoding. Byte-level access: the PC may sit at any
+    /// 2-byte-aligned address on a compressed target, where a raw word
+    /// read is a hard bus error.
+    fn halted_on_ebreak_instruction(&mut self) -> Result<bool, Error> {
+        use crate::architecture::riscv::assembly::{C_EBREAK, EBREAK};
+
+        let pc = self.read_core_reg(RegisterId(0x7b1))?;
+        let addr: u64 = pc.try_into()?;
+
+        let mut word = [0u8; 4];
+        self.read(addr, &mut word)?;
+        let word = u32::from_le_bytes(word);
+        Ok(word == EBREAK || (word & 0xFFFF) == C_EBREAK as u32)
+    }
+
     /// Create a new RISC-V interface for a particular hart.
     pub fn new(
         interface: RiscvCommunicationInterface<'state>,
@@ -312,13 +328,16 @@ impl<'state> CoreInterface for Riscv32<'state> {
             CoreStatus::Halted(HaltReason::Breakpoint(
                 BreakpointCause::Software | BreakpointCause::Semihosting(_)
             ))
-        ) {
-            // If we are halted on a software breakpoint, we can skip the single step and manually advance the dpc.
+        ) && self.halted_on_ebreak_instruction()?
+        {
+            // The PC sits on a real ebreak encoding (a semihosting
+            // sequence or the firmware's own ebreak; a debugger that
+            // manages breakpoints restores the original instruction
+            // before stepping, which fails this check and takes the
+            // hardware single step below). Executing the ebreak would
+            // re-halt on the spot, so advance past it by its size.
             let mut debug_pc = self.read_core_reg(RegisterId(0x7b1))?;
-            // Advance the dpc by the size of the EBREAK (ebreak or c.ebreak) instruction.
             if matches!(self.instruction_set()?, InstructionSet::RV32C) {
-                // We may have been halted by either an EBREAK or a C.EBREAK instruction.
-                // We need to read back the instruction to determine how many bytes we need to skip.
                 let instruction = self.read_word_32(debug_pc.try_into().unwrap())?;
                 if instruction & 0x3 != 0x3 {
                     // Compressed instruction.
