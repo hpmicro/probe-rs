@@ -61,6 +61,10 @@ pub(crate) struct RuntimeTarget<'a> {
     /// `load`; a subsequent write below it marks the start of a new
     /// load whose predecessor aborted without a vFlashDone.
     flash_high_water: Option<u64>,
+    /// Software breakpoints this stub patched into target memory
+    /// (original word per address). The stub owns them so it can
+    /// restore the real instruction around stepping and resuming.
+    sw_breakpoints: Vec<breakpoints::SwBreak>,
 
     /// TCP listener accepting incoming connections
     listener: TcpListener,
@@ -92,6 +96,7 @@ impl<'a> RuntimeTarget<'a> {
             flash_loader: None,
             saw_flash_erase: false,
             flash_high_water: None,
+            sw_breakpoints: Vec::new(),
             listener,
             gdb: None,
             rx_buf: std::collections::VecDeque::new(),
@@ -112,10 +117,13 @@ impl<'a> RuntimeTarget<'a> {
                     tracing::info!("New connection from {:#?}", addr);
 
                     // A new GDB connection must not inherit uncommitted
-                    // flash data buffered by an aborted load.
+                    // flash data buffered by an aborted load, nor the
+                    // software breakpoints an aborted session patched
+                    // into memory.
                     self.flash_loader = None;
                     self.saw_flash_erase = false;
                     self.flash_high_water = None;
+                    self.clear_sw_breakpoints();
 
                     for i in 0..self.cores.len() {
                         let core_id = self.cores[i];
@@ -227,6 +235,23 @@ impl<'a> RuntimeTarget<'a> {
                                             // Some architectures do not allow us to distinguish between hardware and software breakpoints, so we just treat `Unknown` as hardware breakpoints.
                                             MultiThreadStopReason::HwBreak(tid)
                                         }
+                                        HaltReason::Breakpoint(BreakpointCause::Software) => {
+                                            // The architecture layer reports Software for
+                                            // every ebreak halt, including ones in the
+                                            // firmware itself; only an address this stub
+                                            // patched is a GDB software breakpoint.
+                                            let pc: u64 = core
+                                                .read_core_reg(core.program_counter())
+                                                .unwrap_or_default();
+                                            if self.sw_breakpoint_at(pc).is_some() {
+                                                MultiThreadStopReason::SwBreak(tid)
+                                            } else {
+                                                MultiThreadStopReason::SignalWithThread {
+                                                    tid,
+                                                    signal: Signal::SIGINT,
+                                                }
+                                            }
+                                        }
                                         HaltReason::Step => MultiThreadStopReason::DoneStep,
                                         _ => MultiThreadStopReason::SignalWithThread {
                                             tid,
@@ -279,6 +304,11 @@ impl<'a> RuntimeTarget<'a> {
                 }
                 GdbStubStateMachine::Disconnected(state) => {
                     tracing::info!("GDB client disconnected: {:?}", state.get_reason());
+
+                    // Restore the instructions the session's software
+                    // breakpoints patched in, so the free-running target
+                    // cannot trap on a stray ebreak.
+                    self.clear_sw_breakpoints();
 
                     None
                 }
@@ -359,5 +389,14 @@ fn read_chunk_if_available(conn: &mut TcpStream, buf: &mut [u8]) -> Result<usize
         Ok(n) => Ok(n),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
         Err(e) => Err(anyhow::Error::from(e).into()),
+    }
+}
+
+/// A teardown (process exit, dropped stub) must not leave breakpoint
+/// ebreaks patched in target memory: a later bare run of the target
+/// would trap into debug mode with nothing attached to handle it.
+impl Drop for RuntimeTarget<'_> {
+    fn drop(&mut self) {
+        self.clear_sw_breakpoints();
     }
 }

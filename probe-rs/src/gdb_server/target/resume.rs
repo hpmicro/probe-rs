@@ -1,4 +1,5 @@
 use super::{ResumeAction, RuntimeTarget};
+use crate::memory::MemoryInterface as _;
 
 use gdbstub::target::ext::base::multithread::{
     MultiThreadResume, MultiThreadSchedulerLocking, MultiThreadSchedulerLockingOps,
@@ -13,12 +14,21 @@ impl MultiThreadResume for RuntimeTarget<'_> {
             (_, ResumeAction::Resume) => {
                 for core_id in self.cores.iter() {
                     let mut core = session.core(*core_id)?;
+                    if let Some(pc) = self.step_off_sw_breakpoint(&mut core)? {
+                        // The step off the breakpoint already advanced the
+                        // core; park dpc at the new address so run() does
+                        // not single-step a second, extra instruction
+                        // before resuming.
+                        core.write_core_reg(core.program_counter(), pc)?;
+                    }
                     core.run()?;
                 }
             }
             (core_id, ResumeAction::Step) => {
                 let mut core = session.core(core_id)?;
-                core.step()?;
+                if self.step_off_sw_breakpoint(&mut core)?.is_none() {
+                    core.step()?;
+                }
             }
             (_, ResumeAction::Unchanged) => {}
         }
@@ -49,6 +59,34 @@ impl MultiThreadResume for RuntimeTarget<'_> {
 
     fn support_single_step(&mut self) -> Option<MultiThreadSingleStepOps<'_, Self>> {
         Some(self)
+    }
+}
+
+impl RuntimeTarget<'_> {
+    /// Execute the real instruction under a software breakpoint the
+    /// core is parked on: restore the original bytes, hardware-step
+    /// once (a jump lands on its target), re-patch the breakpoint, and
+    /// return the stepped-to PC. Returns None when no stub breakpoint
+    /// sits at the core's PC - the caller steps or resumes directly.
+    /// Skipping the instruction instead of executing it is only
+    /// correct for non-branching instructions, which is why the
+    /// breakpoint must actually run.
+    fn step_off_sw_breakpoint(
+        &self,
+        core: &mut crate::Core,
+    ) -> Result<Option<u64>, super::Error> {
+        if self.sw_breakpoints.is_empty() {
+            return Ok(None);
+        }
+        let pc: u64 = core.read_core_reg(core.program_counter())?;
+        let Some(bp) = self.sw_breakpoint_at(pc) else {
+            return Ok(None);
+        };
+        core.write(pc, &bp.saved[..bp.len])?;
+        core.step()?;
+        let new_pc: u64 = core.read_core_reg(core.program_counter())?;
+        core.write(pc, &Self::breakpoint_bytes(&bp))?;
+        Ok(Some(new_pc))
     }
 }
 

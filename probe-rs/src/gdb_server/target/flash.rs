@@ -96,6 +96,10 @@ impl Flash for RuntimeTarget<'_> {
             .map_err(|e| {
                 tracing::error!("GDB flash download: commit failed: {e}");
                 TargetError::NonFatal
-            })
+            })?;
+        // The committed flash content replaces anything the breakpoint
+        // table still claims.
+        self.sw_breakpoints.clear();
+        Ok(())
     }
 }
