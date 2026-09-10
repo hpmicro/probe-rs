@@ -56,6 +56,8 @@ pub(super) struct Flasher<'session> {
     core_index: usize,
     flash_algorithm: FlashAlgorithm,
     progress: FlashProgress,
+    /// Whether the algorithm has been written to the target's RAM yet.
+    algorithm_loaded: bool,
 }
 
 impl<'session> Flasher<'session> {
@@ -120,16 +122,16 @@ impl<'session> Flasher<'session> {
             target,
         )?;
 
-        let mut this = Self {
+        // The algorithm is loaded lazily on first active use: a flasher
+        // built only to answer layout questions never touches the
+        // target, so it must not pay the halt/reset/load cycle.
+        Ok(Self {
             session,
             core_index,
             flash_algorithm,
             progress,
-        };
-
-        this.load()?;
-
-        Ok(this)
+            algorithm_loaded: false,
+        })
     }
 
     pub(super) fn flash_algorithm(&self) -> &FlashAlgorithm {
@@ -200,6 +202,11 @@ impl<'session> Flasher<'session> {
         &mut self,
         clock: Option<u32>,
     ) -> Result<ActiveFlasher<'_, O>, FlashError> {
+        tracing::debug!("Preparing Flasher for operation {}", O::operation_name());
+        if !self.algorithm_loaded {
+            self.load()?;
+            self.algorithm_loaded = true;
+        }
         let memory_map = self.session.target().memory_map.clone();
         // Attach to memory and core.
         let core = self
@@ -207,13 +214,14 @@ impl<'session> Flasher<'session> {
             .core(self.core_index)
             .map_err(FlashError::Core)?;
 
-        tracing::debug!("Preparing Flasher for operation {}", O::operation_name());
         let mut flasher = ActiveFlasher::<O> {
             core,
             rtt: None,
             memory_map,
             progress: self.progress.clone(),
             flash_algorithm: self.flash_algorithm.clone(),
+            sw_breakpoint_trap_set: false,
+            cached_regs: [None; 8],
             _operation: core::marker::PhantomData,
         };
 
@@ -441,6 +449,142 @@ impl<'session> Flasher<'session> {
     /// This is only possible if the RAM is large enough to
     /// fit at least two page buffers. See [Flasher::double_buffering_supported].
     fn program_double_buffer(&mut self, flash_encoder: &FlashEncoder) -> Result<(), FlashError> {
+        // The routine's program entry passes its length straight to the
+        // flash driver, which loops the pages internally - one large
+        // call per batch replaces the per-page call cycle that
+        // dominates the programming time. The buffers live in the
+        // data region as one contiguous strip sized for a batch; the
+        // batch size follows the scratch space the algorithm's layout
+        // actually provides, so a target whose data region holds
+        // barely two page buffers programs one-page batches instead of
+        // writing past the end of RAM.
+        let page_size = self.flash_algorithm.flash_properties.page_size as u64;
+
+        self.progress
+            .started_programming(flash_encoder.program_size());
+
+        let mut t = Instant::now();
+        let result = self.run_program(|active| {
+            let all_pages: Vec<_> = flash_encoder.pages().to_vec();
+            let mut batch_no = 0usize;
+
+            // Split the page list into runs of consecutive addresses: a
+            // single program call writes one contiguous block, so a gap
+            // in the image (unwritten bytes between sections) must end
+            // the run - writing across it would shift the following
+            // data into the gap.
+            let mut runs: Vec<&[FlashPage]> = Vec::new();
+            let mut run_start = 0usize;
+            for i in 1..=all_pages.len() {
+                let run_break = i == all_pages.len()
+                    || all_pages[i].address() != all_pages[i - 1].address() + page_size;
+                if run_break {
+                    runs.push(&all_pages[run_start..i]);
+                    run_start = i;
+                }
+            }
+
+            // Two strips of half the scratch space each: while the
+            // routine programs from one strip, the next batch's data is
+            // transported into the other - the transport overlaps the
+            // physical write. The system bus reaches the data memory
+            // independently of the hart, so the writes race the routine
+            // instead of waiting for it.
+            let strip_base = active.buffer_address(0);
+            let scratch = active.flash_algorithm.data_end.saturating_sub(strip_base);
+            // The tuned ceiling keeps the transport/program overlap at
+            // the granularity the timing was optimized for; the scratch
+            // bound is what keeps small regions safe.
+            let batch_pages = (((scratch / 2) / page_size) as usize).clamp(1, 16);
+            let strips = [strip_base, strip_base + (batch_pages as u64) * page_size];
+
+            let batches: Vec<&[FlashPage]> = runs
+                .into_iter()
+                .flat_map(|r| r.chunks(batch_pages))
+                .collect();
+
+            // Prefetch the first batch.
+            let mut next_block = Vec::new();
+            for page in batches[0] {
+                next_block.extend_from_slice(page.data());
+            }
+            active.load_data(strips[0], &next_block)?;
+
+            for (i, chunk) in batches.iter().enumerate() {
+                let batch_address = chunk[0].address();
+                let batch_len = next_block.len();
+                let strip = strips[i % 2];
+
+                active.program_block(batch_address, batch_len, strip)?;
+
+                let t_d = Instant::now();
+                // A freshly resumed core can still report its previous
+                // halted state for a moment; waiting for "halted" before
+                // it actually ran would report a fake completion while
+                // the routine is still consuming the buffer. Confirm the
+                // core left the halted state first; while the routine
+                // runs, transport the next batch into the other strip.
+                let leave = Instant::now();
+                loop {
+                    let halted = matches!(
+                        active.core.status().map_err(FlashError::Core)?,
+                        crate::CoreStatus::Halted(_)
+                    );
+                    if !halted {
+                        break;
+                    }
+                    if leave.elapsed() > Duration::from_millis(100) {
+                        return Err(FlashError::RoutineCallFailed {
+                            name: "program_block",
+                            error_code: 0,
+                        });
+                    }
+                }
+
+                next_block.clear();
+                if let Some(next) = batches.get(i + 1) {
+                    for page in *next {
+                        next_block.extend_from_slice(page.data());
+                    }
+                    active.load_data(strips[(i + 1) % 2], &next_block)?;
+                }
+                let _ = t_d;
+
+                let result = active
+                    .wait_for_completion(Duration::from_secs(10))
+                    .map_err(|error| FlashError::PageWrite {
+                        page_address: batch_address,
+                        source: Box::new(error),
+                    })?;
+
+                active.progress.page_programmed(batch_len as u32, t.elapsed());
+                t = Instant::now();
+                if result != 0 {
+                    return Err(FlashError::RoutineCallFailed {
+                        name: "program_block",
+                        error_code: result,
+                    });
+                }
+            }
+
+            Ok(0)
+        });
+
+        if result.is_ok() {
+            self.progress.finished_programming();
+        } else {
+            self.progress.failed_programming();
+
+            result?;
+        }
+
+        Ok(())
+    }
+
+    fn program_double_buffer_per_page(
+        &mut self,
+        flash_encoder: &FlashEncoder,
+    ) -> Result<(), FlashError> {
         let mut current_buf = 0;
         self.progress
             .started_programming(flash_encoder.program_size());
@@ -474,7 +618,9 @@ impl<'session> Flasher<'session> {
                 }
 
                 // Start the next copy process.
+                let t_s = Instant::now();
                 active.start_program_page_with_buffer(page.address(), current_buf)?;
+                eprintln!("SSEG S={}us", t_s.elapsed().as_micros());
 
                 // Swap the buffers
                 if current_buf == 1 {
@@ -558,6 +704,16 @@ pub(super) struct ActiveFlasher<'probe, O: Operation> {
     memory_map: Vec<MemoryRegion>,
     progress: FlashProgress,
     flash_algorithm: FlashAlgorithm,
+    /// Whether the core's dcsr has already been set to trap on ebreak.
+    /// The bit survives halt/resume, so it only needs to be written
+    /// once per flasher; re-writing it costs a CSR read-and-write
+    /// cycle on every algorithm call.
+    sw_breakpoint_trap_set: bool,
+    /// Values of the callee-saved registers (static base, stack
+    /// pointer) as left by the previous algorithm call: the algorithm
+    /// preserves them, so an unchanged value does not need to be
+    /// written again.
+    cached_regs: [Option<u32>; 8],
     _operation: core::marker::PhantomData<O>,
 }
 
@@ -678,12 +834,27 @@ impl<'probe, O: Operation> ActiveFlasher<'probe, O> {
             ),
         ];
 
-        for (description, value) in registers {
+        for (slot, (description, value)) in registers.iter().enumerate() {
             if let Some(v) = value {
-                self.core.write_core_reg(description, v)?;
+                let v = *v;
+                // The callee-saved registers (static base and stack
+                // pointer) keep their values across an algorithm call,
+                // so re-writing them when the previous call already set
+                // the same value is redundant. Every other register -
+                // pc, the arguments, and the scratch registers - is
+                // clobbered by the algorithm run and must always be
+                // written.
+                let cacheable = matches!(slot, 5 | 6);
+                if cacheable && self.cached_regs[slot] == Some(v) {
+                    continue;
+                }
+                if cacheable {
+                    self.cached_regs[slot] = Some(v);
+                }
+                self.core.write_core_reg(*description, v)?;
 
                 if tracing::enabled!(Level::DEBUG) {
-                    let value: u32 = self.core.read_core_reg(description)?;
+                    let value: u32 = self.core.read_core_reg(*description)?;
 
                     tracing::debug!(
                         "content of {} {:#x}: {:#010x} should be: {:#010x}",
@@ -697,8 +868,13 @@ impl<'probe, O: Operation> ActiveFlasher<'probe, O> {
         }
 
         // Ensure RISC-V `ebreak` instructions enter debug mode,
-        // this is necessary for soft breakpoints to work.
-        self.core.debug_on_sw_breakpoint(true)?;
+        // this is necessary for soft breakpoints to work. The dcsr bit
+        // survives halt/resume and nothing in the flasher lifetime
+        // resets it, so writing it once is enough.
+        if !self.sw_breakpoint_trap_set {
+            self.core.debug_on_sw_breakpoint(true)?;
+            self.sw_breakpoint_trap_set = true;
+        }
 
         // Resume target operation.
         self.core.run()?;
@@ -989,6 +1165,27 @@ impl<'p> ActiveFlasher<'p, Program> {
         })?;
 
         Ok(())
+    }
+
+    /// Program a contiguous block of arbitrary length with one routine
+    /// call. The routine's program entry passes the length through to
+    /// the flash driver, which loops the pages internally.
+    pub(super) fn program_block(
+        &mut self,
+        address: u64,
+        length: usize,
+        buffer_address: u64,
+    ) -> Result<(), FlashError> {
+        self.call_function(
+            &Registers {
+                pc: into_reg(self.flash_algorithm.pc_program_page)?,
+                r0: Some(into_reg(address)?),
+                r1: Some(length as u32),
+                r2: Some(into_reg(buffer_address)?),
+                r3: None,
+            },
+            false,
+        )
     }
 
     pub(super) fn load_page_buffer(

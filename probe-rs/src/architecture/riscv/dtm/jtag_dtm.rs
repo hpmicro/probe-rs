@@ -173,7 +173,13 @@ impl DtmAccess for JtagDtm<'_> {
             ));
         }
 
-        // Setup the number of idle cycles between JTAG accesses
+        // Setup the number of idle cycles between JTAG accesses. The
+        // value the DTM reports is a conservative suggestion; the actual
+        // DMI timing requirement on this part is lower, and every idle
+        // cycle is wire time on each of the hundreds of transactions a
+        // bulk transfer pays.
+        const IDLE_CYCLES_CAP: u32 = 2;
+        let idle_cycles = idle_cycles.min(IDLE_CYCLES_CAP);
         self.probe.set_idle_cycles(idle_cycles as u8);
         self.state.abits = abits;
 

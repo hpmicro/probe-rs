@@ -2,6 +2,8 @@
 mod commands;
 mod tools;
 
+use anyhow::anyhow;
+
 use crate::{
     architecture::{
         arm::{
@@ -1275,48 +1277,122 @@ impl RawJtagIo for CmsisDap {
         &mut self.jtag_driver_state
     }
     fn shift_bit(&mut self, tms: bool, tdi: bool, capture: bool) -> Result<(), DebugProbeError> {
-        self.jtag_driver_state.state.update(tms);
-        if let Some(sequence) = self.jtag_sequences.last_mut() {
-            if sequence.append(tms, tdi, capture).is_ok() {
-                return Ok(());
-            }
-        }
-        self.jtag_sequences.push(JtagSequence::new(
-            1,
-            capture,
+        shift_bit_with(
             tms,
-            [u8::from(tdi), 0, 0, 0, 0, 0, 0, 0],
-        )?);
+            tdi,
+            capture,
+            &mut self.jtag_sequences,
+            &mut self.jtag_driver_state,
+        );
+        Ok(())
+    }
+
+    fn shift_bits(
+        &mut self,
+        tms: impl IntoIterator<Item = bool>,
+        tdi: impl IntoIterator<Item = bool>,
+        cap: impl IntoIterator<Item = bool>,
+    ) -> Result<(), DebugProbeError> {
+        encode_shift_bits_with(
+            tms,
+            tdi,
+            cap,
+            &mut self.jtag_sequences,
+            &mut self.jtag_driver_state,
+        );
         Ok(())
     }
     fn read_captured_bits(&mut self) -> Result<BitVec<u8, Lsb0>, DebugProbeError> {
-        let mut capture = BitVec::<u8, Lsb0>::new();
-        // We can transfer up to 255 sequences in one dap jtag-sequence command. But in some riscv chip there is some bug, thus I set up to 3 sequence in once jtag-sequence command transfer.
-        for sequence_slice in self.jtag_sequences.clone().chunks(50) {
-            let mut batch_sequence = Vec::new();
-            batch_sequence.extend_from_slice(sequence_slice);
-            let capture_count = batch_sequence.iter().map(|x| x.capture_count()).sum();
-            match self.send_jtag_sequences(JtagSequenceRequest::new(batch_sequence)?) {
-                Ok(x) => {
-                    let mut batch_capture = BitVec::<u8, Lsb0>::from_vec(x);
-                    batch_capture.truncate(capture_count);
-                    capture.extend_from_bitslice(batch_capture.as_bitslice());
-                }
-                Err(err) => {
-                    self.jtag_sequences.clear();
-                    return Err(err.into());
-                }
-            }
-        }
-        self.jtag_sequences.clear();
-        Ok(capture)
+        // The queue leaves the driver up front: whatever happens on the
+        // wire, no stale sequence survives into the next transfer.
+        let mut sequences = std::mem::take(&mut self.jtag_sequences);
+        let mut transport = DeviceTransport {
+            device: &mut self.device,
+            packet_size: self.packet_size,
+        };
+        read_captured_bits_pipelined(
+            &mut sequences,
+            self.packet_size,
+            JTAG_SEQUENCES_PER_COMMAND,
+            &mut transport,
+        )
     }
+}
+
+/// Feeds encoded sequence batches straight to the device queues. Bulk
+/// devices keep several packets in flight, so the flush loop can
+/// overlap USB round trips with device execution.
+struct DeviceTransport<'a> {
+    device: &'a mut CmsisDapDevice,
+    packet_size: u16,
+}
+
+impl SequenceTransport for DeviceTransport<'_> {
+    fn depth(&self) -> usize {
+        self.device.pipeline_depth()
+    }
+
+    fn submit_batch(&mut self, batch: Vec<JtagSequence>) -> Result<(), DebugProbeError> {
+        use commands::Request;
+
+        let request = JtagSequenceRequest::new(batch).map_err(CmsisDapError::from)?;
+        let mut buffer = vec![0u8; self.packet_size as usize + 1];
+        buffer[1] = <JtagSequenceRequest as Request>::COMMAND_ID as u8;
+        let size = request
+            .to_bytes(&mut buffer[2..])
+            .map_err(|e| CmsisDapError::Send {
+                command_id: <JtagSequenceRequest as Request>::COMMAND_ID,
+                source: e,
+            })?
+            + 2;
+        buffer.truncate(size);
+
+        self.device
+            .submit_buffer(&buffer, self.packet_size as usize)
+            .map_err(|e| map_send_error(e))?;
+        Ok(())
+    }
+
+    fn collect_batch(&mut self) -> Result<Vec<u8>, DebugProbeError> {
+        use commands::{Request, SendError, Status};
+
+        let response = self
+            .device
+            .collect_response(self.packet_size as usize, commands::USB_TIMEOUT)
+            .map_err(map_send_error)?;
+
+        if response.first() != Some(&(<JtagSequenceRequest as Request>::COMMAND_ID as u8)) {
+            return Err(DebugProbeError::ProbeSpecific(Box::new(CmsisDapError::Send {
+                command_id: <JtagSequenceRequest as Request>::COMMAND_ID,
+                source: SendError::CommandIdMismatch(response.first().copied().unwrap_or(0)),
+            })));
+        }
+        let status = Status::from_byte(*response.get(1).unwrap_or(&0xFF)).map_err(map_send_error)?;
+        match status {
+            Status::DAPOk => Ok(response[2..].to_vec()),
+            Status::DAPError => Err(DebugProbeError::ProbeSpecific(Box::new(
+                CmsisDapError::ErrorResponse,
+            ))),
+        }
+    }
+}
+
+fn map_send_error(e: commands::SendError) -> DebugProbeError {
+    DebugProbeError::ProbeSpecific(Box::new(CmsisDapError::Send {
+        command_id: commands::CommandId::JtagSequence,
+        source: e,
+    }))
 }
 impl Drop for CmsisDap {
     fn drop(&mut self) {
         tracing::debug!("Detaching from CMSIS-DAP probe");
         // We ignore the error cases as we can't do much about it anyways.
         let _ = self.process_batch();
+
+        // Cancel any pipelined inbound transfers and read away whatever
+        // the device still holds, so the next program to open the probe
+        // starts from a synchronized stream.
+        self.device.drain();
 
         // If SWO is active, disable it before calling detach,
         // which ensures detach won't error on disabling SWO.
@@ -1328,11 +1404,704 @@ impl Drop for CmsisDap {
     }
 }
 
+/// Sequence cap per DAP_JTAG_SEQUENCE command. The protocol encodes the
+/// count in one byte (maximum 255); the packet byte budgets below are
+/// what actually bound bulk transfers, this cap only keeps any single
+/// command's response wait bounded.
+const JTAG_SEQUENCES_PER_COMMAND: usize = 128;
+
+/// Wire bytes every DAP_JTAG_SEQUENCE command spends before any sequence:
+/// the command id, the sequence count byte, and one byte of report
+/// framing.
+const JTAG_SEQUENCE_HEADER_BYTES: usize = 3;
+
+/// Response bytes spent before any captured TDO data: the status byte.
+/// (On HID v1 devices the response report adds its own framing byte,
+/// which the negotiated report size already accounts for.)
+const JTAG_SEQUENCE_RESPONSE_HEADER_BYTES: usize = 1;
+
+/// Split queued sequences into DAP_JTAG_SEQUENCE commands under three
+/// bounds: at most `max_per_command` sequences per command, each
+/// command's wire size within the device packet (every sequence costs
+/// its info byte plus its TDI payload padded to whole bytes, on top of
+/// the command header), and the command's captured TDO data within the
+/// response packet (every captured sequence answers with its bits
+/// padded to whole bytes, on top of the status byte). Capture-dense
+/// batches overflow the response side long before the request side -
+/// a command full of 41-bit captures spends ~7 request bytes but ~6
+/// response bytes per sequence - and an overflowed response silently
+/// truncates the capture stream, so both budgets bind. A single
+/// sequence too large for a whole packet is an error rather than a
+/// split point.
+fn plan_sequence_commands(
+    sequences: &[JtagSequence],
+    packet_size: u16,
+    max_per_command: usize,
+) -> Result<Vec<Vec<JtagSequence>>, DebugProbeError> {
+    let byte_budget = packet_size as usize - JTAG_SEQUENCE_HEADER_BYTES;
+    let response_budget = packet_size as usize - JTAG_SEQUENCE_RESPONSE_HEADER_BYTES;
+    let mut batches: Vec<Vec<JtagSequence>> = Vec::new();
+    let mut batch: Vec<JtagSequence> = Vec::new();
+    let mut sequences_left = max_per_command;
+    let mut bytes_left = byte_budget;
+    let mut response_bytes_left = response_budget;
+
+    for sequence in sequences {
+        let cost = sequence.wire_bytes();
+        let response_cost = sequence
+            .captured_bits()
+            .map(|bits| bits.div_ceil(8))
+            .unwrap_or(0);
+        if cost > byte_budget || response_cost > response_budget {
+            return Err(DebugProbeError::Other(anyhow!(
+                "a single JTAG sequence costs {cost} wire bytes / \
+                 {response_cost} response bytes and cannot fit the \
+                 {byte_budget}-byte command / {response_budget}-byte \
+                 response budgets"
+            )));
+        }
+        if !batch.is_empty()
+            && (sequences_left == 0
+                || bytes_left < cost
+                || response_bytes_left < response_cost)
+        {
+            batches.push(std::mem::take(&mut batch));
+            sequences_left = max_per_command;
+            bytes_left = byte_budget;
+            response_bytes_left = response_budget;
+        }
+        sequences_left -= 1;
+        bytes_left -= cost;
+        response_bytes_left -= response_cost;
+        batch.push(*sequence);
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    Ok(batches)
+}
+
+/// Extract the captured TDO bits from one command's response. The DAP
+/// pads every captured sequence to a whole number of bytes (e.g. 41 TDO
+/// bits arrive as 48); keep each sequence's captured bits and skip its
+/// padding, so concatenated captures stay aligned - concatenating the
+/// raw bytes and truncating the total would keep interior padding and
+/// misalign every capture after the first.
+fn slice_sequence_captures(
+    batch: &[JtagSequence],
+    response_bytes: &[u8],
+) -> Result<BitVec<u8, Lsb0>, DebugProbeError> {
+    let mut stream = BitVec::<u8, Lsb0>::from_vec(response_bytes.to_vec());
+    let mut capture = BitVec::<u8, Lsb0>::new();
+
+    for sequence in batch {
+        let padded = sequence.captured_bits_padded();
+        if padded == 0 {
+            continue;
+        }
+        let captured = sequence.captured_bits().expect("padded implies captured");
+        if stream.len() < padded {
+            return Err(DebugProbeError::Other(anyhow!(
+                "short JTAG sequence response: need {padded} bits, have {}",
+                stream.len()
+            )));
+        }
+        capture.extend_from_bitslice(&stream[..captured]);
+        stream = stream[padded..].to_bitvec();
+    }
+    Ok(capture)
+}
+
+/// Transport for flushing queued sequences to the probe: commands are
+/// submitted without waiting and responses come back in submission
+/// order. Parameterized so the planning, slicing, pipelining, and
+/// queue-clearing contracts are testable without hardware.
+pub(crate) trait SequenceTransport {
+    /// How many commands may be in flight before the oldest response
+    /// must be collected.
+    fn depth(&self) -> usize;
+
+    /// Submit one batch of sequences. The response arrives later via
+    /// [`SequenceTransport::collect`].
+    fn submit_batch(&mut self, batch: Vec<JtagSequence>) -> Result<(), DebugProbeError>;
+
+    /// Collect the TDO bytes of the oldest submitted, uncollected batch.
+    fn collect_batch(&mut self) -> Result<Vec<u8>, DebugProbeError>;
+}
+
+/// Flush queued sequences through a [`SequenceTransport`] and collect
+/// the captured TDO bits. The queue is consumed up front - whatever
+/// happens on the wire, no stale sequence survives into the next
+/// transfer - and up to `depth` commands run in flight, which is what
+/// lets a bulk probe overlap its USB round trips with device execution.
+fn read_captured_bits_pipelined(
+    queue: &mut Vec<JtagSequence>,
+    packet_size: u16,
+    max_per_command: usize,
+    transport: &mut impl SequenceTransport,
+) -> Result<BitVec<u8, Lsb0>, DebugProbeError> {
+    let sequences = std::mem::take(queue);
+    let batches = plan_sequence_commands(&sequences, packet_size, max_per_command)?;
+    let depth = transport.depth().max(1);
+
+    let mut responses = Vec::with_capacity(batches.len());
+    let mut in_flight = 0usize;
+    for batch in batches.iter() {
+        if in_flight >= depth {
+            responses.push(transport.collect_batch()?);
+            in_flight -= 1;
+        }
+        transport.submit_batch(batch.clone())?;
+        in_flight += 1;
+    }
+    while in_flight > 0 {
+        responses.push(transport.collect_batch()?);
+        in_flight -= 1;
+    }
+
+    let mut capture = BitVec::<u8, Lsb0>::new();
+    for (batch, response_bytes) in batches.into_iter().zip(responses) {
+        capture.extend_from_bitslice(&slice_sequence_captures(&batch, &response_bytes)?);
+    }
+    Ok(capture)
+}
+
+/// Per-clock encoding primitive: advance the tracked TAP state and merge
+/// the clock into the queue tail, starting a fresh sequence when the
+/// (tms, capture) pair changes or the tail is full. Extracted from the
+/// `CmsisDap::shift_bit` body so the per-bit semantics are testable and
+/// serve as the reference side of the batch encoder's differential
+/// tests.
+pub(crate) fn shift_bit_with(
+    tms: bool,
+    tdi: bool,
+    capture: bool,
+    queue: &mut Vec<JtagSequence>,
+    state: &mut JtagDriverState,
+) {
+    state.state.update(tms);
+    let merged = queue
+        .last_mut()
+        .map(|seq| seq.append(tms, tdi, capture).is_ok())
+        .unwrap_or(false);
+    if !merged {
+        queue.push(
+            JtagSequence::new(1, capture, tms, [u8::from(tdi), 0, 0, 0, 0, 0, 0, 0])
+                .expect("a single-clock sequence is always within the 1..=64 bound"),
+        );
+    }
+}
+
+/// Encode a shift_bits triple into the sequence queue with per-clock
+/// semantics bit-identical to feeding every clock through
+/// [`shift_bit_with`]: a sequence boundary appears only where the (tms,
+/// capture) pair changes or the 64-clock bound forces a chunk, and the
+/// queue tail participates in merging exactly as the per-bit path would
+/// (partial merges included). Unlike the per-bit loop, a same-pair
+/// stretch packs its TDI bits straight into the sequence data bytes at
+/// run granularity, which removes the per-clock host cost.
+pub(crate) fn encode_shift_bits_with<I1, I2, I3>(
+    tms: I1,
+    tdi: I2,
+    cap: I3,
+    queue: &mut Vec<JtagSequence>,
+    state: &mut JtagDriverState,
+) where
+    I1: IntoIterator<Item = bool>,
+    I2: IntoIterator<Item = bool>,
+    I3: IntoIterator<Item = bool>,
+{
+    let mut run: Option<(bool, bool, [u8; 8], usize)> = None;
+    for ((tms, tdi), cap) in tms.into_iter().zip(tdi).zip(cap) {
+        state.state.update(tms);
+        match &mut run {
+            Some((r_tms, r_cap, bits, len)) if *r_tms == tms && *r_cap == cap && *len < 64 => {
+                bits[*len / 8] |= u8::from(tdi) << (*len % 8);
+                *len += 1;
+            }
+            _ => {
+                flush_run(run.take(), queue);
+                let mut bits = [0u8; 8];
+                bits[0] = u8::from(tdi);
+                run = Some((tms, cap, bits, 1));
+            }
+        }
+    }
+    flush_run(run.take(), queue);
+}
+
+/// Commit one completed (tms, capture) run into the queue with per-clock
+/// merge semantics: clocks first extend a same-pair tail up to its
+/// remaining 64-clock capacity, and the remainder becomes a fresh
+/// sequence. A committed run never exceeds 64 clocks, so at most one
+/// fresh sequence is created.
+fn flush_run(run: Option<(bool, bool, [u8; 8], usize)>, queue: &mut Vec<JtagSequence>) {
+    let Some((tms, cap, bits, mut len)) = run else {
+        return;
+    };
+    let mut taken = 0;
+    if let Some(tail) = queue.last_mut() {
+        taken = tail.append_bits(tms, cap, &bits, len);
+        len -= taken;
+    }
+    if len > 0 {
+        let mut shifted = [0u8; 8];
+        for i in 0..len {
+            let bit = (bits[(taken + i) / 8] >> ((taken + i) % 8)) & 1;
+            shifted[i / 8] |= bit << (i % 8);
+        }
+        queue.push(
+            JtagSequence::new(len as u8, cap, tms, shifted)
+                .expect("a committed run never exceeds the 64-clock bound"),
+        );
+    }
+}
+
 impl From<ScanChainError> for CmsisDapError {
     fn from(error: ScanChainError) -> Self {
         match error {
             ScanChainError::InvalidIdCode => CmsisDapError::InvalidIdCode,
             ScanChainError::InvalidIR => CmsisDapError::InvalidIR,
+        }
+    }
+}
+
+#[cfg(test)]
+mod sequence_capture_tests {
+    use super::*;
+
+    #[test]
+    fn plan_sequence_commands_splits_by_byte_budget() {
+        let scan = || JtagSequence::new(41, true, false, [0xFF; 8]).unwrap();
+        let bit = || JtagSequence::new(1, false, false, [1, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+
+        // A 41-cycle sequence costs 7 wire bytes; under a 61-byte budget
+        // (64-byte packet minus the header) eight of them fit (8*7=56)
+        // and the ninth would not (63).
+        let sequences: Vec<JtagSequence> = (0..12).map(|_| scan()).collect();
+        let batches = plan_sequence_commands(&sequences, 64, JTAG_SEQUENCES_PER_COMMAND).unwrap();
+        let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![8, 4]);
+
+        // Twenty one-bit sequences (2 bytes each) fit one command.
+        let sequences: Vec<JtagSequence> = (0..20).map(|_| bit()).collect();
+        let batches = plan_sequence_commands(&sequences, 64, JTAG_SEQUENCES_PER_COMMAND).unwrap();
+        assert_eq!(batches.len(), 1);
+
+        // Sixty one-bit sequences under a 61-byte budget split by the BYTE
+        // budget (30*2=60 fits, 31*2=62 does not), not by the count cap.
+        let sequences: Vec<JtagSequence> = (0..60).map(|_| bit()).collect();
+        let batches = plan_sequence_commands(&sequences, 64, JTAG_SEQUENCES_PER_COMMAND).unwrap();
+        let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![30, 30]);
+
+        // With byte room to spare (131-byte budget), the same sixty
+        // sequences fit one command: neither the byte budget nor the
+        // count cap binds.
+        let batches = plan_sequence_commands(&sequences, 131, JTAG_SEQUENCES_PER_COMMAND).unwrap();
+        let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![60]);
+
+        // Two hundred one-bit sequences under a 1021-byte budget split
+        // by the COUNT cap instead.
+        let sequences: Vec<JtagSequence> = (0..200).map(|_| bit()).collect();
+        let batches = plan_sequence_commands(&sequences, 1024, JTAG_SEQUENCES_PER_COMMAND).unwrap();
+        let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![128, 72]);
+
+        // Capture-dense batches: every 41-bit capture sequence answers
+        // with 6 response bytes, so the response budget must bind too -
+        // and no emitted command may exceed either budget.
+        let scans: Vec<JtagSequence> = (0..200).map(|_| scan()).collect();
+        let batches = plan_sequence_commands(&scans, 512, JTAG_SEQUENCES_PER_COMMAND).unwrap();
+        assert!(batches.len() >= 3);
+        for batch in &batches {
+            let wire: usize = batch.iter().map(|s| s.wire_bytes()).sum();
+            let response: usize = batch
+                .iter()
+                .map(|s| s.captured_bits().map(|b| b.div_ceil(8)).unwrap_or(0))
+                .sum();
+            assert!(wire <= 512 - JTAG_SEQUENCE_HEADER_BYTES, "wire {wire}");
+            assert!(
+                response <= 512 - JTAG_SEQUENCE_RESPONSE_HEADER_BYTES,
+                "response {response}"
+            );
+        }
+
+        // Exact fill: with a 64-byte budget, the 32nd one-bit sequence
+        // (remaining 2 == cost) is admitted - an off-by-one split at
+        // equality would produce [31, 29].
+        let sequences: Vec<JtagSequence> = (0..60).map(|_| bit()).collect();
+        let batches = plan_sequence_commands(&sequences, 67, JTAG_SEQUENCES_PER_COMMAND).unwrap();
+        let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![32, 28]);
+    }
+
+    #[test]
+    fn single_sequence_over_budget_rejected() {
+        // A 64-cycle sequence costs 9 wire bytes; a packet leaving only 8
+        // cannot carry it even as a command of its own - that is an
+        // error, not a wrapping split.
+        let sequence = JtagSequence::new(64, true, false, [0xFF; 8]).unwrap();
+        let result = plan_sequence_commands(&[sequence], 11, JTAG_SEQUENCES_PER_COMMAND);
+        assert!(result.is_err());
+    }
+
+    fn padded_capture_stream(captured: &[bool], padding_bits: usize) -> Vec<u8> {
+        // Model the wire format: the captured bits followed by padding to
+        // a whole byte boundary, with the padding bits reading as ones.
+        let mut stream = BitVec::<u8, Lsb0>::new();
+        stream.extend(captured.iter().copied());
+        stream.extend(std::iter::repeat(true).take(padding_bits));
+        stream.into_vec()
+    }
+
+    #[test]
+    fn slice_sequence_captures_strips_interior_padding() {
+        let first: Vec<bool> = (0..41).map(|i| i % 3 == 0).collect();
+        let second: Vec<bool> = (0..41).map(|i| i % 2 == 0).collect();
+        let mut response = padded_capture_stream(&first, 7);
+        response.extend(padded_capture_stream(&second, 7));
+
+        let batch = vec![
+            JtagSequence::new(41, true, false, [0x00; 8]).unwrap(),
+            JtagSequence::new(41, true, false, [0x00; 8]).unwrap(),
+        ];
+        let capture = slice_sequence_captures(&batch, &response).unwrap();
+
+        // Exactly the 82 captured bits survive; the second capture starts
+        // at bit 41, not at the padded 48-bit boundary.
+        assert_eq!(capture.len(), 82);
+        let extracted: Vec<bool> = capture.iter().by_vals().collect();
+        assert_eq!(&extracted[..41], &first[..]);
+        assert_eq!(&extracted[41..], &second[..]);
+    }
+
+    #[test]
+    fn slice_sequence_captures_rejects_short_response() {
+        let batch = vec![JtagSequence::new(41, true, false, [0x00; 8]).unwrap()];
+        // Five bytes carry 40 bits, one short of the 48 the padded
+        // capture must occupy; truncating silently would misalign every
+        // later capture, so this must be an error.
+        let response = vec![0xFFu8; 5];
+        assert!(slice_sequence_captures(&batch, &response).is_err());
+    }
+
+    #[test]
+    fn read_captured_bits_clears_queue_on_send_error() {
+        // A failing transport must propagate the error AND leave no stale
+        // sequence behind: the queue is drained up front, so the next
+        // transfer starts from an empty bitstream.
+        let mut queue: Vec<JtagSequence> = (0..4)
+            .map(|_| JtagSequence::new(41, true, false, [0x00; 8]).unwrap())
+            .collect();
+        let mut transport = MockTransport::error("usb write failed");
+        let result = read_captured_bits_pipelined(
+            &mut queue,
+            64,
+            JTAG_SEQUENCES_PER_COMMAND,
+            &mut transport,
+        );
+        assert!(result.is_err());
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn read_captured_bits_clears_queue_on_short_response() {
+        // A response too short for its padded capture fails the flush; the
+        // queue must still be empty afterwards.
+        let mut queue: Vec<JtagSequence> =
+            vec![JtagSequence::new(41, true, false, [0x00; 8]).unwrap()];
+        let mut transport = MockTransport::short_response();
+        let result = read_captured_bits_pipelined(
+            &mut queue,
+            64,
+            JTAG_SEQUENCES_PER_COMMAND,
+            &mut transport,
+        );
+        assert!(result.is_err());
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn read_captured_bits_slices_padding_end_to_end() {
+        // Two captured 41-bit scans queued as one command; the transport
+        // returns the wire-format response with interior padding, and the
+        // collected capture contains both scans back to back.
+        let first: Vec<bool> = (0..41).map(|i| i % 3 == 0).collect();
+        let second: Vec<bool> = (0..41).map(|i| i % 2 == 0).collect();
+        let mut response = padded_capture_stream(&first, 7);
+        response.extend(padded_capture_stream(&second, 7));
+
+        let mut queue: Vec<JtagSequence> = (0..2)
+            .map(|_| JtagSequence::new(41, true, false, [0x00; 8]).unwrap())
+            .collect();
+        let mut transport = MockTransport::responses(vec![response]);
+        let capture = read_captured_bits_pipelined(
+            &mut queue,
+            64,
+            JTAG_SEQUENCES_PER_COMMAND,
+            &mut transport,
+        )
+        .unwrap();
+        assert_eq!(capture.len(), 82);
+        let extracted: Vec<bool> = capture.iter().by_vals().collect();
+        assert_eq!(&extracted[..41], &first[..]);
+        assert_eq!(&extracted[41..], &second[..]);
+    }
+
+    #[test]
+    fn pipelined_flush_respects_the_depth_window() {
+        // With more batches than the transport keeps in flight, submits
+        // and collects interleave: the in-flight count never exceeds the
+        // depth, every batch is submitted exactly once, and responses
+        // still pair with their batches in order.
+        let first: Vec<bool> = (0..41).map(|i| i % 5 == 0).collect();
+        let second: Vec<bool> = (0..41).map(|i| i % 3 == 0).collect();
+        let responses = vec![
+            padded_capture_stream(&first, 7),
+            padded_capture_stream(&second, 7),
+        ];
+
+        // One sequence per batch (a 4-byte packet budget splits them).
+        let mut queue: Vec<JtagSequence> = (0..2)
+            .map(|_| JtagSequence::new(41, true, false, [0x00; 8]).unwrap())
+            .collect();
+        let mut transport = MockTransport::responses(responses.clone());
+        transport.depth = 1;
+        let capture = read_captured_bits_pipelined(&mut queue, 11, 128, &mut transport).unwrap();
+        assert!(transport.max_in_flight <= 1, "depth window exceeded");
+        let extracted: Vec<bool> = capture.iter().by_vals().collect();
+        assert_eq!(&extracted[..41], &first[..]);
+        assert_eq!(&extracted[41..], &second[..]);
+    }
+
+    /// Hands back canned responses (or errors) in order and records the
+    /// in-flight watermark, so flush tests can assert on pipelining
+    /// behavior without hardware.
+    struct MockTransport {
+        canned: std::collections::VecDeque<Result<Vec<u8>, DebugProbeError>>,
+        depth: usize,
+        in_flight: usize,
+        max_in_flight: usize,
+        submitted: usize,
+    }
+
+    impl MockTransport {
+        fn responses(list: Vec<Vec<u8>>) -> Self {
+            Self {
+                canned: list.into_iter().map(Ok).collect(),
+                depth: 8,
+                in_flight: 0,
+                max_in_flight: 0,
+                submitted: 0,
+            }
+        }
+
+        fn error(message: &'static str) -> Self {
+            Self {
+                canned: [Err(DebugProbeError::Other(anyhow!(message)))]
+                    .into_iter()
+                    .collect(),
+                depth: 8,
+                in_flight: 0,
+                max_in_flight: 0,
+                submitted: 0,
+            }
+        }
+
+        fn short_response() -> Self {
+            Self::responses(vec![vec![0xFF; 5]])
+        }
+    }
+
+    impl SequenceTransport for MockTransport {
+        fn depth(&self) -> usize {
+            self.depth
+        }
+
+        fn submit_batch(&mut self, _batch: Vec<JtagSequence>) -> Result<(), DebugProbeError> {
+            self.submitted += 1;
+            self.in_flight += 1;
+            self.max_in_flight = self.max_in_flight.max(self.in_flight);
+            Ok(())
+        }
+
+        fn collect_batch(&mut self) -> Result<Vec<u8>, DebugProbeError> {
+            self.in_flight -= 1;
+            self.canned
+                .pop_front()
+                .unwrap_or_else(|| Err(DebugProbeError::Other(anyhow!("no response left"))))
+        }
+    }
+}
+
+#[cfg(test)]
+mod batch_encode_tests {
+    use super::*;
+
+    /// The production per-bit primitive, driven clock by clock: the
+    /// reference side of every differential assertion.
+    fn reference(clocks: &[(bool, bool, bool)]) -> (Vec<JtagSequence>, JtagDriverState) {
+        let mut queue = Vec::new();
+        let mut state = JtagDriverState::default();
+        for &(tms, tdi, cap) in clocks {
+            shift_bit_with(tms, tdi, cap, &mut queue, &mut state);
+        }
+        (queue, state)
+    }
+
+    fn batch(clocks: &[(bool, bool, bool)]) -> (Vec<JtagSequence>, JtagDriverState) {
+        let mut queue = Vec::new();
+        let mut state = JtagDriverState::default();
+        encode_shift_bits_with(
+            clocks.iter().map(|c| c.0),
+            clocks.iter().map(|c| c.1),
+            clocks.iter().map(|c| c.2),
+            &mut queue,
+            &mut state,
+        );
+        (queue, state)
+    }
+
+    fn assert_bit_identical(name: &str, clocks: &[(bool, bool, bool)]) {
+        let (rq, rs) = reference(clocks);
+        let (bq, bs) = batch(clocks);
+        assert_eq!(rq.len(), bq.len(), "{name}: sequence count differs");
+        assert_eq!(rq, bq, "{name}: sequence vectors differ");
+        assert_eq!(rs.state, bs.state, "{name}: tracked TAP state differs");
+    }
+
+    /// A data word of pseudo-random TDI bits (bit diversity matters:
+    /// equal-bit runs would not catch data packing bugs).
+    struct BitSource(u8);
+    impl BitSource {
+        fn next(&mut self) -> bool {
+            self.0 = self.0.rotate_left(3) ^ 0x5A;
+            self.0 & 1 == 1
+        }
+    }
+
+    /// 41-bit DMI DR write scan shape: navigation into Shift-DR, 40 data
+    /// clocks under TMS=0, the final data bit riding the TMS=1 exit
+    /// clock (captured), Update-DR, return to idle, then idle clocks.
+    fn dmi_write_scan(idle: usize, seed: u8) -> Vec<(bool, bool, bool)> {
+        let mut bits = BitSource(seed);
+        let mut clocks = vec![
+            (true, false, false), // navigate toward Shift-DR
+            (false, false, false),
+            (false, false, false),
+        ];
+        for _ in 0..40 {
+            clocks.push((false, bits.next(), true));
+        }
+        clocks.push((true, bits.next(), true)); // exit clock carries the last data bit
+        clocks.push((true, false, false)); // Update-DR
+        clocks.push((false, false, false)); // back to idle
+        for _ in 0..idle {
+            clocks.push((false, false, false));
+        }
+        clocks
+    }
+
+    #[test]
+    fn dmi_scan_shape_idle0_and_idle3() {
+        assert_bit_identical("dmi idle=0", &dmi_write_scan(0, 0x1F));
+        assert_bit_identical("dmi idle=3", &dmi_write_scan(3, 0xA7));
+    }
+
+    #[test]
+    fn multi_tap_bypass_capture_toggles_inside_a_run() {
+        // drpre/drpost bypass clocks switch capture false->true->false
+        // inside a single constant-TMS run: the (tms, capture) pair, not
+        // TMS alone, must gate sequence boundaries.
+        let mut bits = BitSource(0x33);
+        let mut clocks: Vec<(bool, bool, bool)> = (0..3).map(|_| (false, false, false)).collect();
+        for _ in 0..41 {
+            clocks.push((false, bits.next(), true));
+        }
+        clocks.extend((0..2).map(|_| (false, false, false)));
+        assert_bit_identical("multi-tap bypass", &clocks);
+    }
+
+    #[test]
+    fn runs_longer_than_64_chunk() {
+        let mut bits = BitSource(0x71);
+        let mut clocks: Vec<(bool, bool, bool)> =
+            (0..260).map(|_| (false, bits.next(), true)).collect();
+        clocks.extend((0..130).map(|_| (false, false, false)));
+        assert_bit_identical("long runs", &clocks);
+    }
+
+    #[test]
+    fn cross_call_merge_at_the_64_boundary() {
+        // A (tms=0, capture=false) tail of 3 clocks meeting a 100-clock
+        // same-pair run: the per-bit reference merges 61 clocks into the
+        // tail and starts a 39-clock sequence; the batch encoder must do
+        // exactly the same, not an all-or-nothing merge.
+        for tail in 1..63 {
+            let mut rq = Vec::new();
+            let mut rs = JtagDriverState::default();
+            for _ in 0..tail {
+                shift_bit_with(false, false, false, &mut rq, &mut rs);
+            }
+            let mut bq = rq.clone();
+            let mut bs = JtagDriverState::default();
+            bs.state = rs.state;
+            let run: Vec<(bool, bool, bool)> =
+                (0..100).map(|i| (false, i % 3 == 0, false)).collect();
+            for &(tms, tdi, cap) in &run {
+                shift_bit_with(tms, tdi, cap, &mut rq, &mut rs);
+            }
+            encode_shift_bits_with(
+                run.iter().map(|c| c.0),
+                run.iter().map(|c| c.1),
+                run.iter().map(|c| c.2),
+                &mut bq,
+                &mut bs,
+            );
+            assert_eq!(rq, bq, "tail {tail}: sequences differ");
+            assert_eq!(rs.state, bs.state, "tail {tail}: state diverges");
+        }
+    }
+
+    #[test]
+    fn infinite_iterators_follow_zip_shortest() {
+        // tms finite, tdi/cap infinite: the tms iterator is the length
+        // authority, exactly like the per-bit default implementation.
+        let tms = [true, false, false, false, false, false];
+        let clocks: Vec<(bool, bool, bool)> = tms.iter().map(|&t| (t, false, false)).collect();
+        let (rq, rs) = reference(&clocks);
+
+        let mut bq = Vec::new();
+        let mut bs = JtagDriverState::default();
+        encode_shift_bits_with(
+            tms,
+            std::iter::repeat(false),
+            std::iter::repeat(false),
+            &mut bq,
+            &mut bs,
+        );
+        assert_eq!(rq, bq);
+        assert_eq!(rs.state, bs.state);
+    }
+
+    #[test]
+    fn capture_toggles_produce_many_small_runs() {
+        let mut clocks = Vec::new();
+        for i in 0..90 {
+            clocks.push((false, i % 5 == 0, i % 3 == 0));
+        }
+        assert_bit_identical("capture toggles", &clocks);
+    }
+
+    #[test]
+    fn prefix_state_tracking_matches_reference() {
+        let clocks = dmi_write_scan(2, 0x9D);
+        for k in [1usize, 7, 45, 48] {
+            let (_, rs) = reference(&clocks[..k]);
+            let (_, bs) = batch(&clocks[..k]);
+            assert_eq!(rs.state, bs.state, "prefix k={k}: state diverges");
         }
     }
 }

@@ -1,6 +1,7 @@
 mod base;
 mod breakpoints;
 mod desc;
+mod flash;
 mod monitor;
 mod resume;
 mod thread;
@@ -8,6 +9,7 @@ mod traits;
 mod utils;
 
 use super::arch::RuntimeArch;
+use crate::flashing::FlashLoader;
 use crate::{BreakpointCause, CoreStatus, Error, HaltReason, Session};
 use gdbstub::stub::state_machine::GdbStubStateMachine;
 use parking_lot::FairMutex;
@@ -21,6 +23,7 @@ use gdbstub::conn::ConnectionExt;
 use gdbstub::stub::{GdbStub, MultiThreadStopReason};
 use gdbstub::target::ext::base::BaseOps;
 use gdbstub::target::ext::breakpoints::BreakpointsOps;
+use gdbstub::target::ext::flash::FlashOps;
 use gdbstub::target::ext::memory_map::MemoryMapOps;
 use gdbstub::target::ext::monitor_cmd::MonitorCmdOps;
 use gdbstub::target::ext::target_description_xml_override::TargetDescriptionXmlOverrideOps;
@@ -47,11 +50,29 @@ pub(crate) struct RuntimeTarget<'a> {
     session: &'a FairMutex<Session>,
     /// A list of core IDs for this stub
     cores: Vec<usize>,
+    /// Buffered flash data of an in-flight GDB `load` (the vFlashWrite
+    /// packets); committed and cleared on vFlashDone. RuntimeTarget is
+    /// reused across GDB connections, so a new connection also clears it.
+    flash_loader: Option<FlashLoader>,
+    /// Whether a vFlashErase was seen without any buffered write data —
+    /// used to fail erase-only transactions (GDB `flash-erase`) loudly.
+    saw_flash_erase: bool,
+    /// Highest end address of the data buffered for the current GDB
+    /// `load`; a subsequent write below it marks the start of a new
+    /// load whose predecessor aborted without a vFlashDone.
+    flash_high_water: Option<u64>,
+    /// Software breakpoints this stub patched into target memory
+    /// (original word per address). The stub owns them so it can
+    /// restore the real instruction around stepping and resuming.
+    sw_breakpoints: Vec<breakpoints::SwBreak>,
 
     /// TCP listener accepting incoming connections
     listener: TcpListener,
     /// The current GDB stub state machine
     gdb: Option<GdbStubStateMachine<'a, RuntimeTarget<'a>, TcpStream>>,
+    /// Bytes read from the connection but not yet fed to the stub state
+    /// machine (bulk-read ahead of per-byte processing).
+    rx_buf: std::collections::VecDeque<u8>,
     /// Resume action to be used upon a continue request
     resume_action: (usize, ResumeAction),
 
@@ -72,8 +93,13 @@ impl<'a> RuntimeTarget<'a> {
         Ok(Self {
             session,
             cores,
+            flash_loader: None,
+            saw_flash_erase: false,
+            flash_high_water: None,
+            sw_breakpoints: Vec::new(),
             listener,
             gdb: None,
+            rx_buf: std::collections::VecDeque::new(),
             resume_action: (0, ResumeAction::Unchanged),
             target_desc: TargetDescription::default(),
         })
@@ -90,6 +116,15 @@ impl<'a> RuntimeTarget<'a> {
                 Ok((s, addr)) => {
                     tracing::info!("New connection from {:#?}", addr);
 
+                    // A new GDB connection must not inherit uncommitted
+                    // flash data buffered by an aborted load, nor the
+                    // software breakpoints an aborted session patched
+                    // into memory.
+                    self.flash_loader = None;
+                    self.saw_flash_erase = false;
+                    self.flash_high_water = None;
+                    self.clear_sw_breakpoints();
+
                     for i in 0..self.cores.len() {
                         let core_id = self.cores[i];
                         // When we first attach to the core, GDB expects us to halt the core, so we do this here when a new client connects.
@@ -102,8 +137,17 @@ impl<'a> RuntimeTarget<'a> {
                         self.load_target_desc()?;
                     }
 
-                    // Start the GDB Stub state machine
-                    let stub = GdbStub::<RuntimeTarget, _>::new(s);
+                    // Start the GDB Stub state machine. A large packet
+                    // buffer lets GDB send bulk memory writes (the `load`
+                    // X packets) in few large transfers instead of one
+                    // round trip per few kilobytes.
+                    let stub = match GdbStub::<RuntimeTarget, _>::builder(s)
+                        .packet_buffer_size(64 * 1024)
+                        .build()
+                    {
+                        Ok(stub) => stub,
+                        Err(e) => return Err(anyhow::Error::from(e).into()),
+                    };
                     match stub.run_state_machine(self) {
                         Ok(gdbstub) => {
                             self.gdb = Some(gdbstub);
@@ -132,18 +176,35 @@ impl<'a> RuntimeTarget<'a> {
 
             self.gdb = match gdb {
                 GdbStubStateMachine::Idle(mut state) => {
-                    // Read data if available
-                    let next_byte = {
-                        let conn = state.borrow_conn();
+                    // Bulk-read new data into the local buffer, then feed
+                    // the state machine byte by byte from it: one socket
+                    // read per chunk instead of one per byte, which is
+                    // what large packets (GDB load writes) would
+                    // otherwise pay tens of thousands of syscalls for.
+                    if self.rx_buf.is_empty() {
+                        let mut chunk = [0u8; 16384];
+                        let n = read_chunk_if_available(state.borrow_conn(), &mut chunk)?;
+                        self.rx_buf.extend(&chunk[..n]);
+                    }
 
-                        read_if_available(conn)?
-                    };
-
-                    if let Some(b) = next_byte {
-                        Some(state.incoming_data(self, b).into_error()?)
-                    } else {
-                        wait_time = Duration::from_millis(10);
+                    if self.rx_buf.is_empty() {
+                        // Short wait: every round trip to GDB (an OK for a
+                        // write packet) pays half this on average, and a
+                        // load is a burst of such round trips.
+                        wait_time = Duration::from_millis(2);
                         Some(state.into())
+                    } else {
+                        let mut current = GdbStubStateMachine::Idle(state);
+                        while matches!(current, GdbStubStateMachine::Idle(_))
+                            && !self.rx_buf.is_empty()
+                        {
+                            let b = self.rx_buf.pop_front().unwrap();
+                            let GdbStubStateMachine::Idle(s) = current else {
+                                unreachable!("matches! guarded above");
+                            };
+                            current = s.incoming_data(self, b).into_error()?;
+                        }
+                        Some(current)
                     }
                 }
                 GdbStubStateMachine::Running(mut state) => {
@@ -173,6 +234,23 @@ impl<'a> RuntimeTarget<'a> {
                                         | HaltReason::Breakpoint(BreakpointCause::Unknown) => {
                                             // Some architectures do not allow us to distinguish between hardware and software breakpoints, so we just treat `Unknown` as hardware breakpoints.
                                             MultiThreadStopReason::HwBreak(tid)
+                                        }
+                                        HaltReason::Breakpoint(BreakpointCause::Software) => {
+                                            // The architecture layer reports Software for
+                                            // every ebreak halt, including ones in the
+                                            // firmware itself; only an address this stub
+                                            // patched is a GDB software breakpoint.
+                                            let pc: u64 = core
+                                                .read_core_reg(core.program_counter())
+                                                .unwrap_or_default();
+                                            if self.sw_breakpoint_at(pc).is_some() {
+                                                MultiThreadStopReason::SwBreak(tid)
+                                            } else {
+                                                MultiThreadStopReason::SignalWithThread {
+                                                    tid,
+                                                    signal: Signal::SIGINT,
+                                                }
+                                            }
                                         }
                                         HaltReason::Step => MultiThreadStopReason::DoneStep,
                                         _ => MultiThreadStopReason::SignalWithThread {
@@ -227,6 +305,11 @@ impl<'a> RuntimeTarget<'a> {
                 GdbStubStateMachine::Disconnected(state) => {
                     tracing::info!("GDB client disconnected: {:?}", state.get_reason());
 
+                    // Restore the instructions the session's software
+                    // breakpoints patched in, so the free-running target
+                    // cannot trap on a stray ebreak.
+                    self.clear_sw_breakpoints();
+
                     None
                 }
             };
@@ -264,6 +347,10 @@ impl Target for RuntimeTarget<'_> {
         Some(self)
     }
 
+    fn support_flash_operations(&mut self) -> Option<FlashOps<'_, Self>> {
+        Some(self)
+    }
+
     fn guard_rail_implicit_sw_breakpoints(&self) -> bool {
         true
     }
@@ -281,5 +368,35 @@ fn read_if_available(conn: &mut TcpStream) -> Result<Option<u8>, Error> {
             }
         }
         Err(e) => Err(anyhow::Error::from(e).into()),
+    }
+}
+
+/// Read whatever the socket has buffered into `buf` without blocking.
+/// Returns 0 when nothing is pending yet. One read per chunk instead of
+/// per byte is what keeps large packets (GDB load writes) from paying
+/// thousands of syscalls each.
+///
+/// A zero-byte read is the peer closing the connection: surfaced as an
+/// error, not as "nothing pending", so the state machine tears the dead
+/// connection down and the listener can accept a new one.
+fn read_chunk_if_available(conn: &mut TcpStream, buf: &mut [u8]) -> Result<usize, Error> {
+    match std::io::Read::read(conn, buf) {
+        Ok(0) => Err(anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "GDB client closed the connection",
+        ))
+        .into()),
+        Ok(n) => Ok(n),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+        Err(e) => Err(anyhow::Error::from(e).into()),
+    }
+}
+
+/// A teardown (process exit, dropped stub) must not leave breakpoint
+/// ebreaks patched in target memory: a later bare run of the target
+/// would trap into debug mode with nothing attached to handle it.
+impl Drop for RuntimeTarget<'_> {
+    fn drop(&mut self) {
+        self.clear_sw_breakpoints();
     }
 }

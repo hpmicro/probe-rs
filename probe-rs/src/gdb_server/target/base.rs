@@ -100,9 +100,12 @@ impl MultiThreadBase for RuntimeTarget<'_> {
         // We currently either read the entire buffer or nothing
         let num_read = data.len();
 
-        core.read(start_addr, data)
+        let n = core
+            .read(start_addr, data)
             .map(|_| num_read)
-            .into_target_result_non_fatal()
+            .into_target_result_non_fatal()?;
+        self.present_original_instructions(start_addr, data);
+        Ok(n)
     }
 
     fn write_addrs(
@@ -111,11 +114,48 @@ impl MultiThreadBase for RuntimeTarget<'_> {
         data: &[u8],
         tid: Tid,
     ) -> gdbstub::target::TargetResult<(), Self> {
+        // A write covering a software breakpoint replaces the patched
+        // encoding; keep the table truthful so a later removal does not
+        // restore the pre-write bytes over the new data.
+        self.sw_breakpoints
+            .retain(|bp| bp.addr + bp.len as u64 <= start_addr || bp.addr >= start_addr + data.len() as u64);
         let mut session = self.session.lock();
         let mut core = session.core(tid.get() - 1).into_target_result()?;
 
-        core.write_8(start_addr, data)
-            .into_target_result_non_fatal()
+        // Byte-granular bus writes cost one DMI transaction per byte.
+        // GDB's bulk writes (X packets) are word-aligned for all but the
+        // section edges, so route the aligned middle through 32-bit
+        // writes and only the head/tail bytes individually.
+        let head_len = if start_addr & 3 == 0 {
+            0
+        } else {
+            (4 - (start_addr & 3) as usize).min(data.len())
+        };
+        if head_len > 0 {
+            core.write_8(start_addr, &data[..head_len])
+                .into_target_result_non_fatal()?;
+        }
+
+        let body = &data[head_len..];
+        let body_addr = start_addr + head_len as u64;
+        let tail_len = body.len() & 3;
+        let mid_len = body.len() - tail_len;
+
+        if mid_len > 0 {
+            let mut words = vec![0u32; mid_len / 4];
+            for (chunk, word) in body.chunks_exact(4).zip(words.iter_mut()) {
+                *word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+            core.write_32(body_addr, &words)
+                .into_target_result_non_fatal()?;
+        }
+
+        if tail_len > 0 {
+            core.write_8(body_addr + mid_len as u64, &body[mid_len..])
+                .into_target_result_non_fatal()?;
+        }
+
+        Ok(())
     }
 
     fn list_active_threads(
@@ -232,6 +272,30 @@ fn write_register_from_source(
 
             core.write_core_reg(low, low_word)?;
             core.write_core_reg(high, high_word)
+        }
+    }
+}
+
+impl RuntimeTarget<'_> {
+    /// Reads must present the original instruction at a stub software
+    /// breakpoint, not the patched ebreak - the stub-managed-breakpoint
+    /// contract - so a read covering a breakpoint splices the saved
+    /// bytes into the returned buffer.
+    pub(super) fn present_original_instructions(&self, start_addr: u64, data: &mut [u8]) {
+        for bp in &self.sw_breakpoints {
+            let read_end = start_addr + data.len() as u64;
+            let bp_end = bp.addr + bp.len as u64;
+            if bp.addr >= read_end || bp_end <= start_addr {
+                continue;
+            }
+            let offset = bp.addr.saturating_sub(start_addr) as usize;
+            // A read starting inside the breakpoint must splice from the
+            // matching saved bytes, not from the start of the saved
+            // instruction.
+            let saved_offset = start_addr.saturating_sub(bp.addr) as usize;
+            let overlap = (read_end - bp.addr.max(start_addr)) as usize;
+            let n = overlap.min(bp.len - saved_offset.min(bp.len));
+            data[offset..offset + n].copy_from_slice(&bp.saved[saved_offset..saved_offset + n]);
         }
     }
 }

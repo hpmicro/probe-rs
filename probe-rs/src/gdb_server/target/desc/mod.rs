@@ -12,6 +12,7 @@ use gdbstub::target::ext::target_description_xml_override::TargetDescriptionXmlO
 use gdbstub::target::TargetError;
 
 use crate::config::MemoryRegion;
+use crate::flashing::FlashLoader;
 use crate::{CoreType, Session};
 
 pub(crate) use data::{GdbRegisterSource, TargetDescription};
@@ -99,20 +100,91 @@ fn gdb_memory_map(session: &mut Session, primary_core_id: usize) -> Result<Strin
 
         xml_map.push_str(&region_entry);
     } else {
-        for region in &session.target().memory_map {
-            let region_kind = match region {
-                MemoryRegion::Ram(_) => "ram",
-                MemoryRegion::Generic(_) => "rom",
-                MemoryRegion::Nvm(_) => "rom",
-            };
+        let target = session.target();
+        for region in &target.memory_map {
             let range = region.address_range();
             let start = range.start;
             let length = range.end - range.start;
-            let region_entry = format!(
-                r#"<memory type="{region_kind}" start="{start:#x}" length="{length:#x}"/>\n"#,
-            );
 
-            xml_map.push_str(&region_entry);
+            match region {
+                MemoryRegion::Ram(_) => {
+                    let region_entry = format!(
+                        r#"<memory type="ram" start="{start:#x}" length="{length:#x}"/>\n"#,
+                    );
+                    xml_map.push_str(&region_entry);
+                }
+                MemoryRegion::Generic(_) => {
+                    let region_entry = format!(
+                        r#"<memory type="rom" start="{start:#x}" length="{length:#x}"/>\n"#,
+                    );
+                    xml_map.push_str(&region_entry);
+                }
+                MemoryRegion::Nvm(nvm_region) => {
+                    // GDB only routes writes through the vFlash* packets
+                    // for regions typed "flash", and it requires a
+                    // blocksize property (an erase block, per the memory
+                    // map DTD) for those regions. Regions that cannot be
+                    // served — alias windows (the loader skips them, so
+                    // advertising them as flash would silently drop the
+                    // data), regions without a covering algorithm, or
+                    // algorithms without a usable erase geometry — stay
+                    // "rom" so GDB fails the write visibly.
+                    let flash_entry = if nvm_region.is_alias {
+                        tracing::warn!(
+                            "memory map: alias NVM region {start:#x}..{:#x} served as rom",
+                            start + length
+                        );
+                        None
+                    } else {
+                        match FlashLoader::get_flash_algorithm_for_region(nvm_region, target) {
+                            Ok(algorithm) => {
+                                let blocksize = algorithm
+                                    .flash_properties
+                                    .sectors
+                                    .first()
+                                    .map(|s| s.size)
+                                    .filter(|s| *s > 0);
+                                match blocksize {
+                                    Some(blocksize) => Some(blocksize),
+                                    None => {
+                                        tracing::warn!(
+                                            "memory map: NVM region {start:#x}..{:#x} has no nonzero erase sector size; served as rom",
+                                            start + length
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "memory map: NVM region {start:#x}..{:#x} has no usable flash algorithm ({e}); served as rom",
+                                    start + length
+                                );
+                                None
+                            }
+                        }
+                    };
+
+                    match flash_entry {
+                        Some(blocksize) => {
+                            let region_entry = format!(
+                                r#"<memory type="flash" start="{start:#x}" length="{length:#x}">
+    <property name="blocksize">{blocksize:#x}</property>
+</memory>
+"#,
+                            );
+                            xml_map.push_str(&region_entry);
+                        }
+                        None => {
+                            let region_entry = format!(
+                                r#"<memory type="rom" start="{start:#x}" length="{length:#x}"/>
+"#,
+                            );
+                            xml_map.push_str(&region_entry);
+                        }
+                    }
+                }
+            }
         }
     }
 
