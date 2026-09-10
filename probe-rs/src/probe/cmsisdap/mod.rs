@@ -66,7 +66,7 @@ use std::{fmt::Write, time::Duration};
 
 use bitvec::prelude::*;
 
-use super::common::{extract_idcodes, extract_ir_lengths, ScanChainError};
+use super::common::{extract_idcodes, extract_ir_lengths, ScanChainError, IR_SHADOW_INVALID};
 
 /// A factory for creating [`CmsisDap`] probes.
 #[derive(Debug)]
@@ -849,6 +849,14 @@ impl DebugProbe for CmsisDap {
                         self.send_jtag_configure(JtagConfigureRequest::new(ir_lens.clone())?)?;
                         self.reset_jtag_state_machine()?;
 
+                        // Install the single-TAP chain before the
+                        // verification read so the register access knows the
+                        // IR length; the chain parameters depend only on the
+                        // IR length, so the IDCODE starts as a placeholder
+                        // and is replaced by the verified value below.
+                        self.jtag_driver_state.scan_chain = single_tap_chain(ir_lens[0], 0);
+                        self.select_target(0)?;
+
                         let response = JTAGAccess::read_register(self, 0x01, 32)?;
                         let idcode = u32::from_le_bytes([
                             response[0],
@@ -863,11 +871,7 @@ impl DebugProbe for CmsisDap {
                             )));
                         }
                         tracing::info!("cJTAG chain verified, IDCODE: {idcode:#010x}");
-
-                        // Install a single-TAP chain from the definition so
-                        // select_target can derive the chain parameters.
                         self.jtag_driver_state.scan_chain = single_tap_chain(ir_lens[0], idcode);
-                        self.select_target(0)?;
 
                         // On a freshly powered target, the first IR update
                         // after the cJTAG activation does not take effect,
@@ -876,7 +880,7 @@ impl DebugProbe for CmsisDap {
                         // cached IR here reloads the unchanged instruction
                         // (IDCODE), absorbing that first update so the next
                         // switch lands.
-                        self.jtag_driver_state.current_ir_reg = u32::MAX;
+                        self.jtag_driver_state.current_ir_reg = IR_SHADOW_INVALID;
                         let _ = JTAGAccess::read_register(self, 0x01, 32)?;
                     }
                     None => {
@@ -1466,12 +1470,15 @@ impl SequenceTransport for DeviceTransport<'_> {
             .map_err(map_send_error)?;
 
         if response.first() != Some(&(<JtagSequenceRequest as Request>::COMMAND_ID as u8)) {
-            return Err(DebugProbeError::ProbeSpecific(Box::new(CmsisDapError::Send {
-                command_id: <JtagSequenceRequest as Request>::COMMAND_ID,
-                source: SendError::CommandIdMismatch(response.first().copied().unwrap_or(0)),
-            })));
+            return Err(DebugProbeError::ProbeSpecific(Box::new(
+                CmsisDapError::Send {
+                    command_id: <JtagSequenceRequest as Request>::COMMAND_ID,
+                    source: SendError::CommandIdMismatch(response.first().copied().unwrap_or(0)),
+                },
+            )));
         }
-        let status = Status::from_byte(*response.get(1).unwrap_or(&0xFF)).map_err(map_send_error)?;
+        let status =
+            Status::from_byte(*response.get(1).unwrap_or(&0xFF)).map_err(map_send_error)?;
         match status {
             Status::DAPOk => Ok(response[2..].to_vec()),
             Status::DAPError => Err(DebugProbeError::ProbeSpecific(Box::new(
@@ -1565,9 +1572,7 @@ fn plan_sequence_commands(
             )));
         }
         if !batch.is_empty()
-            && (sequences_left == 0
-                || bytes_left < cost
-                || response_bytes_left < response_cost)
+            && (sequences_left == 0 || bytes_left < cost || response_bytes_left < response_cost)
         {
             batches.push(std::mem::take(&mut batch));
             sequences_left = max_per_command;
@@ -1819,9 +1824,14 @@ fn tap_reset_kind(protocol: Option<WireProtocol>) -> TapResetKind {
 /// Software half of a TAP reset: park the tracked state at idle without
 /// emitting wire traffic. The on-wire kind parks the state through the
 /// reset train itself.
+///
+/// The software kind never puts the TAP through Test-Logic-Reset, and the
+/// protocol activation it accompanies may disturb the IR, so the tracked
+/// instruction is invalidated just the same.
 fn apply_tap_reset(state: &mut JtagDriverState, kind: TapResetKind) {
     if kind == TapResetKind::SoftwareOnly {
         state.state = JtagState::Idle;
+        state.current_ir_reg = IR_SHADOW_INVALID;
     }
 }
 
@@ -1954,6 +1964,20 @@ mod cjtag_tests {
         let mut state = JtagDriverState::default();
         apply_tap_reset(&mut state, TapResetKind::SoftwareOnly);
         assert_eq!(state.state, JtagState::Idle);
+    }
+
+    #[test]
+    fn software_tap_reset_invalidates_ir_shadow() {
+        // The software-only reset never puts the TAP through
+        // Test-Logic-Reset, and the cJTAG activation it accompanies may
+        // disturb the IR: a stale tracked instruction must not survive a
+        // re-attach on the same probe object.
+        let mut state = JtagDriverState {
+            current_ir_reg: 0x01,
+            ..Default::default()
+        };
+        apply_tap_reset(&mut state, TapResetKind::SoftwareOnly);
+        assert_eq!(state.current_ir_reg, IR_SHADOW_INVALID);
     }
 
     #[test]
