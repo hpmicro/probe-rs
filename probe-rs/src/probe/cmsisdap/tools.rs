@@ -205,10 +205,16 @@ pub fn open_v2_device(device_info: &DeviceInfo) -> Option<CmsisDapDevice> {
             match device.claim_interface(interface.interface_number()) {
                 Ok(handle) => {
                     tracing::debug!("Opening {:04x}:{:04x} in CMSIS-DAPv2 mode", vid, pid);
+                    let out_ep = eps[0].address();
+                    let in_ep = eps[1].address();
+                    let out_queue = handle.bulk_out_queue(out_ep);
+                    let in_queue = handle.bulk_in_queue(in_ep);
                     return Some(CmsisDapDevice::V2 {
                         handle,
-                        out_ep: eps[0].address(),
-                        in_ep: eps[1].address(),
+                        out_ep,
+                        in_ep,
+                        out_queue,
+                        in_queue,
                         swo_ep,
                         max_packet_size: eps[1].max_packet_size(),
                     });
@@ -242,6 +248,12 @@ pub fn open_device_from_selector(
     // If nusb cannot be used, we will just use the first HID interface and
     // try to open that.
     let mut hid_device_info = None;
+    // Selector matched at least one device but no CMSIS-DAP interface was
+    // identified from its USB descriptors. This may be a board probe that
+    // raced into a VCP-only enumeration, or simply descriptors that could
+    // not be read (driver or permission issues) — the hidapi fallback
+    // below can still open the probe, so warn without asserting a cause.
+    let mut matched_no_dap = false;
 
     // Try using nusb to open a v2 device. This might fail if
     // the device does not support v2 operation or due to driver
@@ -252,6 +264,9 @@ pub fn open_device_from_selector(
 
             if selector.matches(&device) {
                 hid_device_info = get_cmsisdap_info(&device);
+                if hid_device_info.is_none() {
+                    matched_no_dap = true;
+                }
 
                 if hid_device_info.is_some() {
                     // If the VID, PID, and potentially SN all match,
@@ -279,6 +294,10 @@ pub fn open_device_from_selector(
     );
 
     // Attempt to open provided VID/PID/SN with hidapi
+
+    if matched_no_dap {
+        tracing::warn!("{}", vcp_race_warning(selector));
+    }
 
     let hid_api = HidApi::new()?;
 
@@ -343,4 +362,39 @@ fn is_known_cmsis_dap_dev(device: &DeviceInfo) -> bool {
     KNOWN_DAPS
         .iter()
         .any(|&(vid, pid)| device.vendor_id() == vid && device.product_id() == pid)
+}
+
+/// Guidance for a selector match that exposed no CMSIS-DAP interface: a
+/// board probe can race into a VCP-only enumeration, which a reconnect
+/// clears.
+fn vcp_race_warning(selector: &DebugProbeSelector) -> String {
+    format!(
+        "Device {:04x}:{:04x} matched the selector but no CMSIS-DAP interface \
+         was identified from its USB descriptors (the descriptor strings may \
+         be unreadable due to driver or permission issues). If this is a board \
+         probe it may also have enumerated as VCP-only (a known race): \
+         unplug/replug or power-cycle the probe and retry.",
+        selector.vendor_id, selector.product_id
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vcp_race_warning_guides_recovery() {
+        let selector = DebugProbeSelector {
+            vendor_id: 0x34b7,
+            product_id: 0x8001,
+            serial_number: None,
+        };
+        let msg = vcp_race_warning(&selector);
+        assert!(msg.contains("34b7:8001"), "{msg}");
+        assert!(msg.contains("no CMSIS-DAP interface"), "{msg}");
+        assert!(msg.contains("unreadable"), "{msg}");
+        assert!(msg.contains("VCP-only"), "{msg}");
+        assert!(msg.contains("unplug/replug"), "{msg}");
+        assert!(msg.contains("power-cycle"), "{msg}");
+    }
 }

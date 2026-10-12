@@ -40,6 +40,12 @@ pub struct FlashAlgorithm {
     /// least as large as the region's `page_size` attribute. If at least 2 buffers are included in
     /// the list, then double buffered programming will be enabled.
     pub page_buffers: Vec<u64>,
+    /// End of the contiguous data scratch space the algorithm was laid
+    /// out in: everything from the first page buffer up to here is
+    /// buffer space. Batched programming must keep its buffers inside
+    /// this range - the two listed page buffers are the minimum, not
+    /// the whole space, and beyond this range lies other memory.
+    pub data_end: u64,
 
     /// Location of optional RTT control block.
     ///
@@ -402,6 +408,7 @@ impl FlashAlgorithm {
             instructions,
             pc_init: raw.pc_init.map(|v| code_start + v),
             pc_uninit: raw.pc_uninit.map(|v| code_start + v),
+            data_end: data_range.end,
             pc_program_page: code_start + raw.pc_program_page,
             pc_erase_sector: code_start + raw.pc_erase_sector,
             pc_erase_all: raw.pc_erase_all.map(|v| code_start + v),

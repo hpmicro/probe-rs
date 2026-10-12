@@ -787,6 +787,9 @@ impl DebugProbe for JLink {
             let jlink_interface = match protocol {
                 WireProtocol::Swd => Interface::Swd,
                 WireProtocol::Jtag => Interface::Jtag,
+                // Selecting the probe's CJtag interface requires firmware
+                // 1149.7 support that has not been validated; reject it.
+                WireProtocol::CJtag => return Err(DebugProbeError::UnsupportedProtocol(protocol)),
             };
 
             if !self.interfaces.contains(jlink_interface) {
@@ -855,6 +858,10 @@ impl DebugProbe for JLink {
             let jlink_interface = match self.protocol {
                 WireProtocol::Swd => Interface::Swd,
                 WireProtocol::Jtag => Interface::Jtag,
+                // Unreachable via select_protocol, which rejects CJtag.
+                WireProtocol::CJtag => {
+                    return Err(DebugProbeError::UnsupportedProtocol(self.protocol))
+                }
             };
 
             self.select_interface(jlink_interface)?;
@@ -895,6 +902,8 @@ impl DebugProbe for JLink {
 
                 // We are ready to debug.
             }
+            // Unreachable via select_protocol, which rejects CJtag.
+            WireProtocol::CJtag => return Err(DebugProbeError::UnsupportedProtocol(self.protocol)),
         }
 
         tracing::debug!("Attached succesfully");

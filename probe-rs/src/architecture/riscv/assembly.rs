@@ -3,6 +3,9 @@
 /// RISC-V breakpoint instruction
 pub const EBREAK: u32 = 0b000000000001_00000_000_00000_1110011;
 
+/// Compressed RISC-V breakpoint instruction (`c.ebreak`)
+pub const C_EBREAK: u16 = 0b1001000000000010;
+
 /// Assemble a `lw` instruction.
 pub fn lw(offset: u16, base: u8, width: u8, destination: u8) -> u32 {
     let opcode = 0b000_0011;

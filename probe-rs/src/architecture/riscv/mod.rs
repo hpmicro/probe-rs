@@ -37,6 +37,22 @@ pub struct Riscv32<'state> {
 }
 
 impl<'state> Riscv32<'state> {
+    /// Whether the instruction at the halted PC is physically an ebreak
+    /// or c.ebreak encoding. Byte-level access: the PC may sit at any
+    /// 2-byte-aligned address on a compressed target, where a raw word
+    /// read is a hard bus error.
+    fn halted_on_ebreak_instruction(&mut self) -> Result<bool, Error> {
+        use crate::architecture::riscv::assembly::{C_EBREAK, EBREAK};
+
+        let pc = self.read_core_reg(RegisterId(0x7b1))?;
+        let addr: u64 = pc.try_into()?;
+
+        let mut word = [0u8; 4];
+        self.read(addr, &mut word)?;
+        let word = u32::from_le_bytes(word);
+        Ok(word == EBREAK || (word & 0xFFFF) == C_EBREAK as u32)
+    }
+
     /// Create a new RISC-V interface for a particular hart.
     pub fn new(
         interface: RiscvCommunicationInterface<'state>,
@@ -88,9 +104,30 @@ impl<'state> Riscv32<'state> {
             0x40705013, // srai x0, x0, 7 (NOP encoding the semihosting call number 7)
         ];
 
-        // Read the actual instructions, starting at the instruction before the ebreak (PC-4)
-        let mut actual_instructions = [0u32; 3];
-        self.read_32((pc - 4) as u64, &mut actual_instructions)?;
+        // Read the actual instructions, starting at the instruction before
+        // the ebreak (PC-4). The PC only carries the instruction
+        // alignment (2 bytes with compressed instructions), so this read
+        // must go through the aligning byte-level reader: a raw word read
+        // at a misaligned address is a hard system bus error, and the
+        // error latches until cleared. A PC at the very base of a memory
+        // region (e.g. the reset entry at the start of flash) makes the
+        // PC-4 window itself unmapped - a failing read there simply means
+        // no semihosting sequence can precede this PC.
+        let mut instruction_bytes = [0u8; 12];
+        match self.read((pc - 4) as u64, &mut instruction_bytes) {
+            Ok(()) => {}
+            Err(e) => match e {
+                crate::Error::Riscv(RiscvError::SystemBusAccess) => return Ok(None),
+                other => return Err(other),
+            },
+        }
+        let actual_instructions: [u32; 3] = core::array::from_fn(|i| {
+            u32::from_le_bytes(
+                instruction_bytes[i * 4..(i + 1) * 4]
+                    .try_into()
+                    .expect("a 4-byte slice of a 12-byte buffer"),
+            )
+        });
         let actual_instructions = actual_instructions.as_slice();
 
         tracing::debug!(
@@ -291,13 +328,16 @@ impl<'state> CoreInterface for Riscv32<'state> {
             CoreStatus::Halted(HaltReason::Breakpoint(
                 BreakpointCause::Software | BreakpointCause::Semihosting(_)
             ))
-        ) {
-            // If we are halted on a software breakpoint, we can skip the single step and manually advance the dpc.
+        ) && self.halted_on_ebreak_instruction()?
+        {
+            // The PC sits on a real ebreak encoding (a semihosting
+            // sequence or the firmware's own ebreak; a debugger that
+            // manages breakpoints restores the original instruction
+            // before stepping, which fails this check and takes the
+            // hardware single step below). Executing the ebreak would
+            // re-halt on the spot, so advance past it by its size.
             let mut debug_pc = self.read_core_reg(RegisterId(0x7b1))?;
-            // Advance the dpc by the size of the EBREAK (ebreak or c.ebreak) instruction.
             if matches!(self.instruction_set()?, InstructionSet::RV32C) {
-                // We may have been halted by either an EBREAK or a C.EBREAK instruction.
-                // We need to read back the instruction to determine how many bytes we need to skip.
                 let instruction = self.read_word_32(debug_pc.try_into().unwrap())?;
                 if instruction & 0x3 != 0x3 {
                     // Compressed instruction.

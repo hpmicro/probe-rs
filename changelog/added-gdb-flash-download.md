@@ -1,0 +1,1 @@
+The GDB server now supports flashing through the GDB `load` command: target definitions with a flash algorithm are announced as flash regions in the GDB memory map (with their erase block size), and the vFlashWrite/vFlashErase/vFlashDone packets buffer and commit the image through the regular probe-rs flash loader — the same path `probe-rs download` uses.

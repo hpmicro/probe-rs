@@ -79,7 +79,7 @@ rmp-serde = "1"
 hexdump = { version = "0.1", optional = true }
 
 # gdb server
-gdbstub = { version = "0.7", optional = true }
+gdbstub = { version = "0.7.9", optional = true }
 
 [build-dependencies]
 probe-rs-target.workspace = true

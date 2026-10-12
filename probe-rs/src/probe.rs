@@ -38,7 +38,7 @@ const LOW_TARGET_VOLTAGE_WARNING_THRESHOLD: f32 = 1.4;
 
 /// The protocol that is to be used by the probe when communicating with the target.
 ///
-/// For ARM select `Swd` and for RISC-V select `Jtag`.
+/// For ARM select `Swd` and for RISC-V select `Jtag` or `CJtag` (probe-dependent).
 #[derive(Copy, Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum WireProtocol {
     /// Serial Wire Debug is ARMs proprietary standard for communicating with ARM cores.
@@ -47,6 +47,19 @@ pub enum WireProtocol {
     /// JTAG is a standard which is supported by many chips independent of architecture.
     /// See [`Wikipedia`](https://en.wikipedia.org/wiki/JTAG) for more info.
     Jtag,
+    /// cJTAG (compact JTAG, IEEE 1149.7), 2-pin OScan1 mode.
+    /// Requires probe firmware support (CMSIS-DAP vendor capability bit 9);
+    /// the probe firmware performs the OScan1 activation during connect.
+    CJtag,
+}
+
+impl WireProtocol {
+    /// Whether the protocol is part of the JTAG family - the 4-pin
+    /// classic or a compact encoding of it. Architectures reached over
+    /// JTAG-style scans (RISC-V, Xtensa) accept any family member.
+    pub fn is_jtag_family(&self) -> bool {
+        matches!(self, WireProtocol::Jtag | WireProtocol::CJtag)
+    }
 }
 
 impl fmt::Display for WireProtocol {
@@ -54,6 +67,7 @@ impl fmt::Display for WireProtocol {
         match self {
             WireProtocol::Swd => write!(f, "SWD"),
             WireProtocol::Jtag => write!(f, "JTAG"),
+            WireProtocol::CJtag => write!(f, "cJTAG"),
         }
     }
 }
@@ -65,8 +79,9 @@ impl std::str::FromStr for WireProtocol {
         match &s.to_ascii_lowercase()[..] {
             "swd" => Ok(WireProtocol::Swd),
             "jtag" => Ok(WireProtocol::Jtag),
+            "cjtag" => Ok(WireProtocol::CJtag),
             _ => Err(format!(
-                "'{s}' is not a valid protocol. Choose from [swd, jtag]."
+                "'{s}' is not a valid protocol. Choose from [swd, jtag, cjtag]."
             )),
         }
     }
@@ -1230,6 +1245,14 @@ impl DeferredResultIndex {
         Self(Arc::new(()))
     }
 
+    /// Constructor for test doubles that implement the deferred-result
+    /// interfaces without a real command queue; the indices they hand out
+    /// are opaque tokens anyway.
+    #[cfg(test)]
+    pub(crate) fn new_for_testing() -> Self {
+        Self::new()
+    }
+
     fn id(&self) -> usize {
         Arc::as_ptr(&self.0) as usize
     }
@@ -1293,5 +1316,56 @@ mod test {
             selector.serial_number,
             Some("DC:DA:0C:D3:FE:D8".to_string())
         );
+    }
+
+    #[test]
+    fn wire_protocol_cjtag_parsing() {
+        use std::str::FromStr;
+
+        assert_eq!(
+            WireProtocol::from_str("cjtag").unwrap(),
+            WireProtocol::CJtag
+        );
+        assert_eq!(
+            WireProtocol::from_str("CJTAG").unwrap(),
+            WireProtocol::CJtag
+        );
+        assert_eq!(
+            WireProtocol::from_str("Cjtag").unwrap(),
+            WireProtocol::CJtag
+        );
+        assert_eq!(WireProtocol::CJtag.to_string(), "cJTAG");
+
+        let err = WireProtocol::from_str("foo").unwrap_err();
+        assert!(err.contains("cjtag"), "error must list cjtag: {err}");
+    }
+
+    #[test]
+    fn wire_protocol_cjtag_serde_roundtrip() {
+        let encoded = bincode::serialize(&WireProtocol::CJtag).unwrap();
+        let decoded: WireProtocol = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded, WireProtocol::CJtag);
+    }
+
+    #[test]
+    fn is_jtag_family_classifies_protocols() {
+        assert!(WireProtocol::Jtag.is_jtag_family());
+        assert!(WireProtocol::CJtag.is_jtag_family());
+        assert!(!WireProtocol::Swd.is_jtag_family());
+    }
+
+    #[test]
+    fn wire_protocol_serde_rejects_unknown_discriminant() {
+        // WireProtocol is deserialized from user configuration files, so
+        // garbage input must fail cleanly. bincode encodes the variant
+        // index as a little-endian u32, so the inputs are full-width
+        // discriminants rather than truncated bytes.
+        for discriminant in [7u8, 4] {
+            let encoded = [discriminant, 0, 0, 0];
+            assert!(
+                bincode::deserialize::<WireProtocol>(&encoded).is_err(),
+                "discriminant {discriminant} must be rejected"
+            );
+        }
     }
 }

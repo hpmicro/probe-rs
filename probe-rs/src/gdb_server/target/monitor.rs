@@ -26,6 +26,7 @@ impl MonitorCmd for RuntimeTarget<'_> {
             }
             "reset" => {
                 outputln!(out, "Resetting target");
+                self.sw_breakpoints.clear();
                 match self.session.lock().core(0)?.reset() {
                     Ok(_) => {
                         outputln!(out, "Done")
@@ -38,6 +39,7 @@ impl MonitorCmd for RuntimeTarget<'_> {
             "reset halt" => {
                 let timeout: Duration = Duration::new(1, 0);
                 outputln!(out, "Resetting and halting target");
+                self.sw_breakpoints.clear();
                 match self.session.lock().core(0)?.reset_and_halt(timeout) {
                     Ok(_) => {
                         outputln!(out, "Target halted")

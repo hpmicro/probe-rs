@@ -3,7 +3,7 @@ use super::super::{CmsisDapError, CommandId, Request, SendError, Status};
 
 use bitvec::prelude::*;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sequence {
     /// Number of TCK cycles: 1..64 (64 encoded as 0)
     tck_cycles: u8,
@@ -111,13 +111,56 @@ impl Sequence {
             Err(())
         }
     }
-    // Get how many tdo-bits need to be capture in this sequence.
-    pub(crate) fn capture_count(&self) -> usize {
-        if self.tdo_capture {
-            self.tck_cycles as usize
-        } else {
-            0
+
+    /// Append up to `count` clocks taken from the packed TDI bits (bit i
+    /// at `tdi_bits[i/8] >> (i%8)`), merging only while the (tms,
+    /// capture) pair matches and the 64-clock bound leaves room. Returns
+    /// how many clocks were taken - the batch-shaped counterpart of
+    /// repeatedly calling [`Sequence::append`].
+    pub(crate) fn append_bits(
+        &mut self,
+        tms: bool,
+        capture: bool,
+        tdi_bits: &[u8; 8],
+        count: usize,
+    ) -> usize {
+        if self.tms != tms || self.tdo_capture != capture {
+            return 0;
         }
+        let take = (64 - self.tck_cycles as usize).min(count);
+        let start = self.tck_cycles as usize;
+        for i in 0..take {
+            let bit = (tdi_bits[i / 8] >> (i % 8)) & 1;
+            self.data[(start + i) / 8] |= bit << ((start + i) % 8);
+        }
+        self.tck_cycles += take as u8;
+        take
+    }
+    /// Number of TDO bits this sequence contributes to the response
+    /// (the wire format pads every captured sequence to a whole number
+    /// of bytes, so consumers must skip `(captured_bits_padded -
+    /// captured_bits)` padding bits after each one).
+    pub(crate) fn captured_bits(&self) -> Option<usize> {
+        if self.tdo_capture {
+            Some(self.tck_cycles as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Total response bits the wire format reserves for this sequence,
+    /// padding included.
+    pub(crate) fn captured_bits_padded(&self) -> usize {
+        match self.captured_bits() {
+            Some(n) => (n + 7) / 8 * 8,
+            None => 0,
+        }
+    }
+
+    /// Bytes this sequence occupies in a DAP_JTAG_SEQUENCE command:
+    /// one info byte plus the TDI payload padded to whole bytes.
+    pub(crate) fn wire_bytes(&self) -> usize {
+        1 + (self.tck_cycles as usize + 7) / 8
     }
 }
 
@@ -173,7 +216,7 @@ impl Request for SequenceRequest {
 
     fn parse_response(&self, buffer: &[u8]) -> Result<Self::Response, SendError> {
         let mut received_len_bytes = 1;
-        let status = Status::from_byte(buffer[0])?;
+        let status = Status::from_byte(*buffer.first().ok_or(SendError::NotEnoughData)?)?;
 
         self.sequences.iter().for_each(|&sequence| {
             if sequence.tdo_capture {
@@ -184,10 +227,72 @@ impl Request for SequenceRequest {
             }
         });
 
-        let response = buffer[1..received_len_bytes].to_vec();
+        let response = buffer
+            .get(1..received_len_bytes)
+            .ok_or(SendError::NotEnoughData)?
+            .to_vec();
         Ok(SequenceResponse(status, response))
     }
 }
 
 #[derive(Debug)]
 pub struct SequenceResponse(pub(crate) Status, pub(crate) Vec<u8>);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captured_bits_and_padded_bits() {
+        let sequence = Sequence::new(41, true, false, [0xFF; 8]).expect("41 cycles is in range");
+        assert_eq!(sequence.captured_bits(), Some(41));
+        // 41 TDO bits occupy 48 wire bits (six whole bytes).
+        assert_eq!(sequence.captured_bits_padded(), 48);
+
+        // Uncaptured sequences reserve no response bits at all.
+        let sequence = Sequence::new(41, false, false, [0x00; 8]).expect("41 cycles is in range");
+        assert_eq!(sequence.captured_bits(), None);
+        assert_eq!(sequence.captured_bits_padded(), 0);
+
+        // Byte-aligned captures carry no padding.
+        for cycles in [8u8, 64] {
+            let sequence =
+                Sequence::new(cycles, true, false, [0x00; 8]).expect("cycles is in range");
+            assert_eq!(sequence.captured_bits(), Some(cycles as usize));
+            assert_eq!(sequence.captured_bits_padded(), cycles as usize);
+        }
+    }
+
+    #[test]
+    fn wire_bytes_matches_request_layout() {
+        // One info byte plus the TDI payload padded to whole bytes.
+        for (cycles, expected) in [(1u8, 2usize), (8, 2), (9, 3), (41, 7), (64, 9)] {
+            let sequence =
+                Sequence::new(cycles, false, false, [0x00; 8]).expect("cycles is in range");
+            assert_eq!(sequence.wire_bytes(), expected, "tck_cycles = {cycles}");
+        }
+    }
+
+    #[test]
+    fn short_response_is_an_error_not_a_panic() {
+        // A device answering with fewer bytes than the captured sequences
+        // occupy must surface NotEnoughData; the parsing layer must never
+        // panic on a malformed response.
+        let sequence = Sequence::new(41, true, false, [0x00; 8]).expect("cycles is in range");
+        let request = SequenceRequest::new(vec![sequence]).expect("one sequence is in range");
+
+        // No payload at all.
+        assert!(matches!(
+            request.parse_response(&[]),
+            Err(SendError::NotEnoughData)
+        ));
+        // Status byte only: the 48 capture bits (6 bytes) are missing.
+        assert!(matches!(
+            request.parse_response(&[0x00]),
+            Err(SendError::NotEnoughData)
+        ));
+        // Complete response parses.
+        let full = [0x00u8, 1, 2, 3, 4, 5, 6];
+        assert!(request.parse_response(&full).is_ok());
+    }
+}

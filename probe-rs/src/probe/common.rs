@@ -372,6 +372,19 @@ impl JtagState {
     }
 }
 
+/// Sentinel for the tracked IR instruction: no valid instruction is
+/// addressable, so the next register access must load the IR. Used
+/// whenever the IR content is not exactly known - initial state, after
+/// Test-Logic-Reset (each TAP then holds its own architecture-specific
+/// IDCODE encoding), and after any raw IR shift that bypassed the
+/// tracked `write_register` path.
+///
+/// The value cannot alias a real instruction: an all-ones BYPASS opcode
+/// equal to `u32::MAX` would require a 32-bit IR, and chain
+/// configuration derives `max_ir_address` as `(1 << irlen) - 1` in
+/// `u32`, which cannot represent a 32-bit IR length at all.
+pub(crate) const IR_SHADOW_INVALID: u32 = u32::MAX;
+
 #[derive(Debug)]
 pub(crate) struct JtagDriverState {
     pub state: JtagState,
@@ -390,7 +403,7 @@ impl Default for JtagDriverState {
     fn default() -> Self {
         Self {
             state: JtagState::Reset,
-            current_ir_reg: 1,
+            current_ir_reg: IR_SHADOW_INVALID,
             max_ir_address: 0x0F,
             expected_scan_chain: None,
             scan_chain: Vec::new(),
@@ -400,8 +413,44 @@ impl Default for JtagDriverState {
     }
 }
 
+/// The on-wire TAP reset train: five TMS-high cycles reach
+/// test-logic-reset, the trailing low bit exits to idle.
+const ON_WIRE_TAP_RESET_TMS: [bool; 6] = [true, true, true, true, true, false];
+
+/// Emit the on-wire TAP reset train and flush it, so the TAP passes
+/// through test-logic-reset and the next operation starts from a known
+/// state on an empty bitstream. Shared by the [`RawJtagIo`] default and
+/// protocol-specific overrides that reset on the wire.
+pub(crate) fn run_on_wire_tap_reset<Io: RawJtagIo + ?Sized>(
+    io: &mut Io,
+) -> Result<(), DebugProbeError> {
+    tracing::debug!("Resetting JTAG chain by setting tms high for 5 bits");
+
+    io.shift_bits(
+        ON_WIRE_TAP_RESET_TMS,
+        iter::repeat(true),
+        iter::repeat(false),
+    )?;
+    let response = io.read_captured_bits()?;
+
+    tracing::debug!("Response to reset: {}", response);
+
+    // Test-Logic-Reset loads each TAP's own IDCODE instruction
+    // (IEEE 1149.1), whose opcode encoding is architecture-specific,
+    // so no single tracked value can represent the IR content.
+    io.state_mut().current_ir_reg = IR_SHADOW_INVALID;
+
+    Ok(())
+}
+
 /// A trait for implementing low-level JTAG interface operations.
 pub(crate) trait RawJtagIo {
+    /// Contract for both `shift_bit` and `shift_bits`: implementations
+    /// must leave the tracked TAP state exactly as if every emitted
+    /// clock had been processed by the reference per-bit state machine -
+    /// the tracker advances as clocks are ACCEPTED INTO THE QUEUE, not
+    /// when the queue is later flushed, because batch preparation
+    /// navigates via the tracked state between flushes.
     /// Returns a mutable reference to the current state.
     fn state_mut(&mut self) -> &mut JtagDriverState;
 
@@ -433,18 +482,7 @@ pub(crate) trait RawJtagIo {
 
     /// Resets the JTAG state machine by shifting out a number of high TMS bits.
     fn reset_jtag_state_machine(&mut self) -> Result<(), DebugProbeError> {
-        tracing::debug!("Resetting JTAG chain by setting tms high for 5 bits");
-
-        // Reset JTAG chain (5 times TMS high), and enter idle state afterwards
-        let tms = [true, true, true, true, true, false];
-        let tdi = iter::repeat(true);
-
-        self.shift_bits(tms, tdi, iter::repeat(false))?;
-        let response = self.read_captured_bits()?;
-
-        tracing::debug!("Response to reset: {}", response);
-
-        Ok(())
+        run_on_wire_tap_reset(self)
     }
 
     /// Configures the probe to address the given target.
@@ -478,9 +516,22 @@ fn jtag_move_to_state(
         target
     );
 
-    while let Some(tms) = protocol.state().state.step_toward(target) {
-        protocol.shift_bit(tms, false, false)?;
+    // Plan the whole TMS path on a local copy of the tracked state, then
+    // emit it as a single shift_bits call: the per-clock tracker
+    // contract (see RawJtagIo) keeps the real state in lockstep, and the
+    // batch call lets drivers encode the navigation without per-clock
+    // host work.
+    let mut planned: Vec<bool> = Vec::new();
+    let mut sim = protocol.state().state;
+    while let Some(tms) = sim.step_toward(target) {
+        sim.update(tms);
+        planned.push(tms);
     }
+    protocol.shift_bits(
+        planned.into_iter(),
+        iter::repeat(false),
+        iter::repeat(false),
+    )?;
 
     tracing::trace!("In state: {:?}", protocol.state_mut().state);
     Ok(())
@@ -502,6 +553,13 @@ fn shift_ir(
             len
         )));
     }
+
+    // Whatever this raw shift leaves in the IR, the tracked instruction
+    // no longer matches it. Invalidate up front so error paths cannot
+    // exit with a stale shadow; callers that load a known instruction
+    // through `prepare_write_register` restore the tracked value on
+    // success.
+    protocol.state_mut().current_ir_reg = IR_SHADOW_INVALID;
 
     // BYPASS commands before and after shifting out data where required
     let pre_bits = protocol.state().chain_params.irpre;
@@ -901,5 +959,254 @@ mod tests {
 
             assert!(transitions < 10);
         }
+    }
+
+    /// Records shifted bits and models the capture queue, so the on-wire
+    /// TAP reset sequence can be verified without hardware.
+    struct FakeRawJtagIo {
+        state: JtagDriverState,
+        shifted: Vec<(bool, bool, bool)>,
+        queued_bits: usize,
+        flushed_bits: usize,
+    }
+
+    impl FakeRawJtagIo {
+        fn new() -> Self {
+            Self {
+                state: JtagDriverState::default(),
+                shifted: Vec::new(),
+                queued_bits: 0,
+                flushed_bits: 0,
+            }
+        }
+    }
+
+    impl RawJtagIo for FakeRawJtagIo {
+        fn state_mut(&mut self) -> &mut JtagDriverState {
+            &mut self.state
+        }
+
+        fn state(&self) -> &JtagDriverState {
+            &self.state
+        }
+
+        fn shift_bit(
+            &mut self,
+            tms: bool,
+            tdi: bool,
+            capture: bool,
+        ) -> Result<(), DebugProbeError> {
+            self.shifted.push((tms, tdi, capture));
+            self.queued_bits += 1;
+            Ok(())
+        }
+
+        fn read_captured_bits(&mut self) -> Result<BitVec<u8, Lsb0>, DebugProbeError> {
+            self.flushed_bits += self.queued_bits;
+            self.queued_bits = 0;
+            Ok(BitVec::new())
+        }
+    }
+
+    #[test]
+    fn on_wire_reset_flushes_the_train() {
+        let mut io = FakeRawJtagIo::new();
+
+        run_on_wire_tap_reset(&mut io).unwrap();
+
+        // Exactly the reset train is emitted: five TMS-high cycles into
+        // test-logic-reset, trailing low bit to idle, TDI high, nothing
+        // captured.
+        assert_eq!(
+            io.shifted,
+            vec![
+                (true, true, false),
+                (true, true, false),
+                (true, true, false),
+                (true, true, false),
+                (true, true, false),
+                (false, true, false),
+            ]
+        );
+
+        // The train is flushed: every queued bit was consumed by
+        // read_captured_bits, so the next operation starts from an empty
+        // bitstream instead of sharing a sequence with the reset train.
+        assert_eq!(io.queued_bits, 0);
+        assert_eq!(io.flushed_bits, 6);
+    }
+
+    #[test]
+    fn raw_jtag_io_default_reset_uses_the_shared_helper() {
+        // The trait default must route through the same shared sequence as
+        // protocol-specific overrides, so a flush regression breaks both.
+        let mut io = FakeRawJtagIo::new();
+
+        RawJtagIo::reset_jtag_state_machine(&mut io).unwrap();
+
+        assert_eq!(io.shifted.len(), 6);
+        assert_eq!(io.queued_bits, 0);
+        assert_eq!(io.flushed_bits, 6);
+    }
+}
+
+#[cfg(test)]
+/// Records every clock a driver emits, through the per-bit primitive:
+/// the default `shift_bits` (used by the batched navigation) funnels
+/// into `shift_bit`, so both navigation styles land in the same log.
+struct Recorder {
+    driver: JtagDriverState,
+    clocks: Vec<(bool, bool, bool)>,
+    /// TAP state after each accepted clock, for unambiguous assertions
+    /// about which registers an operation navigated through.
+    states: Vec<JtagState>,
+}
+
+#[cfg(test)]
+impl Recorder {
+    fn new(start: JtagState) -> Self {
+        Self {
+            driver: JtagDriverState {
+                state: start,
+                ..Default::default()
+            },
+            clocks: Vec::new(),
+            states: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl RawJtagIo for Recorder {
+    fn state(&self) -> &JtagDriverState {
+        &self.driver
+    }
+
+    fn state_mut(&mut self) -> &mut JtagDriverState {
+        &mut self.driver
+    }
+
+    fn shift_bit(&mut self, tms: bool, tdi: bool, cap: bool) -> Result<(), DebugProbeError> {
+        self.driver.state.update(tms);
+        self.clocks.push((tms, tdi, cap));
+        self.states.push(self.driver.state);
+        Ok(())
+    }
+
+    fn read_captured_bits(&mut self) -> Result<BitVec<u8, Lsb0>, DebugProbeError> {
+        Ok(BitVec::new())
+    }
+}
+
+#[cfg(test)]
+mod move_state_batch_tests {
+    use super::*;
+
+    /// The pre-batching navigation: one shift_bit per step.
+    fn reference_move(io: &mut Recorder, target: JtagState) {
+        while let Some(tms) = io.driver.state.step_toward(target) {
+            io.shift_bit(tms, false, false).unwrap();
+        }
+    }
+
+    #[test]
+    fn batched_navigation_matches_per_bit_reference() {
+        let states = [
+            JtagState::Reset,
+            JtagState::Idle,
+            JtagState::Dr(RegisterState::Select),
+            JtagState::Dr(RegisterState::Capture),
+            JtagState::Dr(RegisterState::Shift),
+            JtagState::Dr(RegisterState::Update),
+            JtagState::Ir(RegisterState::Select),
+            JtagState::Ir(RegisterState::Shift),
+            JtagState::Ir(RegisterState::Update),
+        ];
+        for start in states {
+            for target in states {
+                let mut reference = Recorder::new(start);
+                reference_move(&mut reference, target);
+                let mut batched = Recorder::new(start);
+                jtag_move_to_state(&mut batched, target).unwrap();
+                assert_eq!(
+                    reference.clocks, batched.clocks,
+                    "clock stream differs for {start:?}->{target:?}"
+                );
+                assert_eq!(
+                    reference.driver.state, batched.driver.state,
+                    "tracked state differs for {start:?}->{target:?}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod ir_shadow_tests {
+    use super::*;
+
+    /// True if the recorded states pass through Shift-IR, which every IR
+    /// load must. Asserting on the tracked state trajectory, not on TMS
+    /// patterns, keeps this unambiguous regardless of idle cycles.
+    fn passes_through_shift_ir(states: &[JtagState]) -> bool {
+        states.contains(&JtagState::Ir(RegisterState::Shift))
+    }
+
+    #[test]
+    fn tap_reset_invalidates_ir_shadow() {
+        let mut io = Recorder::new(JtagState::Idle);
+        io.driver.current_ir_reg = 0x1F;
+
+        io.reset_jtag_state_machine().unwrap();
+
+        // Each TAP holds its own architecture-specific IDCODE encoding
+        // after Test-Logic-Reset, so no single tracked value is correct.
+        assert_eq!(io.driver.current_ir_reg, IR_SHADOW_INVALID);
+    }
+
+    #[test]
+    fn raw_ir_shift_invalidates_ir_shadow() {
+        let mut io = Recorder::new(JtagState::Ir(RegisterState::Update));
+        io.driver.chain_params.irlen = 5;
+        io.driver.current_ir_reg = 1;
+
+        shift_ir(&mut io, &[0xFF], 8, false).unwrap();
+
+        // A raw IR shift bypasses the tracked write_register path, so the
+        // shadow must not claim any instruction afterwards.
+        assert_eq!(io.driver.current_ir_reg, IR_SHADOW_INVALID);
+    }
+
+    #[test]
+    fn invalidated_ir_shadow_forces_ir_load_on_next_access() {
+        // The state an IR-length probe leaves behind: IR was shifted
+        // directly, so the tracked instruction no longer matches the TAP.
+        let mut io = Recorder::new(JtagState::Ir(RegisterState::Update));
+        io.driver.chain_params.irlen = 5;
+        shift_ir(&mut io, &[0xFF], 8, false).unwrap();
+        // Only clocks after this point belong to the access under test.
+        io.clocks.clear();
+        io.states.clear();
+
+        prepare_write_register(&mut io, 1, &[0; 4], 32, false).unwrap();
+
+        assert!(
+            passes_through_shift_ir(&io.states),
+            "IR load must happen when the shadow is invalidated"
+        );
+    }
+
+    #[test]
+    fn matching_ir_shadow_skips_ir_load() {
+        let mut io = Recorder::new(JtagState::Ir(RegisterState::Update));
+        io.driver.chain_params.irlen = 5;
+        io.driver.current_ir_reg = 1;
+
+        prepare_write_register(&mut io, 1, &[0; 4], 32, false).unwrap();
+
+        assert!(
+            !passes_through_shift_ir(&io.states),
+            "IR load must be skipped when the shadow already matches"
+        );
     }
 }

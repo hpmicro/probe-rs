@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::architecture::riscv::communication_interface::{
     RiscvCommunicationInterface, RiscvDebugInterfaceState, RiscvError, RiscvInterfaceBuilder,
 };
-use crate::probe::DebugProbeError;
+use crate::probe::{DebugProbeError, WireProtocol};
 use crate::probe::{
     CommandResult, DeferredResultIndex, DeferredResultSet, JTAGAccess, JtagCommandQueue,
     JtagWriteCommand,
@@ -121,6 +121,29 @@ impl<'probe> JtagDtm<'probe> {
         }))
     }
 
+    /// Queue a DMI scan whose response skips the status-check transform.
+    ///
+    /// The deferred result carries the raw TDO capture of the scan, so the
+    /// caller can read the op field of responses that the standard
+    /// transform would turn into errors (e.g. a busy status that callers
+    /// recover from by re-arming the system-bus address register). The
+    /// returned index is captured; its response reflects the *previous*
+    /// DMI operation, per the one-scan DMI pipeline delay.
+    fn schedule_raw_dmi_scan(
+        &mut self,
+        op: DmiOperation,
+    ) -> Result<DeferredResultIndex, RiscvError> {
+        let bytes = op.to_byte_batch();
+        let bit_size = dmi_scan_bit_length(self.state.abits);
+
+        Ok(self.state.queued_commands.schedule(JtagWriteCommand {
+            address: DMI_ADDRESS,
+            data: bytes.to_vec(),
+            transform: raw_dmi_transform,
+            len: bit_size,
+        }))
+    }
+
     fn dmi_register_access_with_timeout(
         &mut self,
         op: DmiOperation,
@@ -173,7 +196,17 @@ impl DtmAccess for JtagDtm<'_> {
             ));
         }
 
-        // Setup the number of idle cycles between JTAG accesses
+        // Setup the number of idle cycles between JTAG accesses. The
+        // value the DTM reports is a conservative suggestion, and on
+        // 4-pin JTAG the actual DMI timing requirement of this part is
+        // far lower - every idle cycle is wire time per transaction,
+        // hundreds of times over in a bulk transfer. cJTAG keeps the
+        // reported value: its TMS-clocked frames need the full recovery
+        // time (DMI busy errors appear at a lower cap).
+        let idle_cycles = match self.probe.active_protocol() {
+            Some(WireProtocol::CJtag) => idle_cycles,
+            _ => idle_cycles.min(2),
+        };
         self.probe.set_idle_cycles(idle_cycles as u8);
         self.state.abits = abits;
 
@@ -260,6 +293,25 @@ impl DtmAccess for JtagDtm<'_> {
     ) -> Result<Option<DeferredResultIndex>, RiscvError> {
         self.schedule_dmi_register_access(DmiOperation::Write { address, value })
             .map(Some)
+    }
+
+    fn schedule_raw_read(&mut self, address: u64) -> Result<DeferredResultIndex, RiscvError> {
+        self.schedule_raw_dmi_scan(DmiOperation::Read { address })
+    }
+
+    fn schedule_raw_noop(&mut self) -> Result<DeferredResultIndex, RiscvError> {
+        self.schedule_raw_dmi_scan(DmiOperation::NoOp)
+    }
+
+    fn schedule_raw_read_uncaptured(&mut self, address: u64) -> Result<(), RiscvError> {
+        self.schedule_raw_dmi_scan(DmiOperation::Read { address })?;
+        Ok(())
+    }
+
+    fn set_debug_idle_cycles(&mut self, idle: u8) -> Result<u8, RiscvError> {
+        let previous = self.probe.idle_cycles();
+        self.probe.set_idle_cycles(idle);
+        Ok(previous)
     }
 
     fn schedule_read(&mut self, address: u64) -> Result<DeferredResultIndex, RiscvError> {
@@ -372,6 +424,22 @@ const DTMCS_WIDTH: u32 = 32;
 /// Address of the `dmi` JTAG register
 const DMI_ADDRESS: u32 = 0x11;
 
+/// Width of a DMI scan on the wire: the abits-wide address field, the
+/// 32-bit data field, and the 2-bit op field.
+fn dmi_scan_bit_length(abits: u32) -> u32 {
+    abits + DMI_ADDRESS_BIT_OFFSET
+}
+
+/// Raw-response transform for DMI scans queued via `schedule_raw_dmi_scan`:
+/// always succeeds and passes the capture through unchanged, so callers can
+/// decode the op/data fields of non-Ok statuses themselves.
+fn raw_dmi_transform(
+    _command: &JtagWriteCommand,
+    response: Vec<u8>,
+) -> Result<CommandResult, crate::Error> {
+    Ok(CommandResult::VecU8(response))
+}
+
 /// Offset of the `address` field in the `dmi` JTAG register.
 const DMI_ADDRESS_BIT_OFFSET: u32 = 34;
 
@@ -391,4 +459,40 @@ bitfield! {
     pub dmistat, _: 11,10;
     pub abits, _: 9,4;
     pub version, _: 3,0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_transform(_: &JtagWriteCommand, _: Vec<u8>) -> Result<CommandResult, crate::Error> {
+        unreachable!("the test never invokes the command transform")
+    }
+
+    #[test]
+    fn raw_dmi_transform_passes_capture_through() {
+        // The raw transform must never grow a status check: sequences that
+        // manage their own recovery decode non-Ok responses themselves.
+        let command = JtagWriteCommand {
+            address: DMI_ADDRESS,
+            data: vec![0; 6],
+            transform: dummy_transform,
+            len: dmi_scan_bit_length(7),
+        };
+        let capture = vec![0xFD, 0xFF, 0x00, 0x00, 0x00, 0x00];
+        let result = raw_dmi_transform(&command, capture.clone()).unwrap();
+        match result {
+            CommandResult::VecU8(bytes) => assert_eq!(bytes, capture),
+            other => panic!("expected the untouched capture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dmi_scan_bit_length_is_abits_plus_34() {
+        // The DMI register is the abits-wide address field, the 32-bit
+        // data field, and the 2-bit op field; abits = 7 yields the
+        // 41-bit scans the system-bus pipeline schedules.
+        assert_eq!(dmi_scan_bit_length(7), 41);
+        assert_eq!(dmi_scan_bit_length(1), 35);
+    }
 }

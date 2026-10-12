@@ -1,0 +1,1 @@
+Add built-in support for the HPMicro HPM5100 series (HPM5151): RISC-V target definition with ILM/DLM memory map, XPI0 boot flash, a self-contained flash algorithm image, and the JTAG scan chain declaration that lets cJTAG attaches configure the IR length without a measuring scan.
